@@ -39,9 +39,16 @@ class Storage:
         CREATE TABLE IF NOT EXISTS paper_state (
             id INTEGER PRIMARY KEY CHECK(id=1),updated_at TEXT NOT NULL,state_json TEXT NOT NULL
         );
+        -- One row per observed market so window-level queries stay O(windows)
+        -- instead of scanning every observation on each engine cycle.
+        CREATE TABLE IF NOT EXISTS market_windows (
+            ticker TEXT PRIMARY KEY,first_observation_id INTEGER NOT NULL,last_observation_id INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_observations_ticker ON observations(ticker,id);
         ''')
         self._migrate_observations()
         self._migrate_trades()
+        self._sync_market_windows()
         self.db.commit()
 
     def _migrate_observations(self):
@@ -66,6 +73,18 @@ class Storage:
         for name, typ in additions.items():
             if name not in columns:
                 self.db.execute(f'ALTER TABLE trades ADD COLUMN {name} {typ}')
+
+    def _sync_market_windows(self):
+        # Backfills databases created before market_windows existed (and any
+        # rows written by older builds); save_observation keeps it current.
+        known = self.db.execute('SELECT COALESCE(MAX(last_observation_id),0) FROM market_windows').fetchone()[0]
+        self.db.execute(
+            '''INSERT INTO market_windows(ticker,first_observation_id,last_observation_id)
+               SELECT ticker,MIN(id),MAX(id) FROM observations WHERE id>? GROUP BY ticker
+               ON CONFLICT(ticker) DO UPDATE SET
+               last_observation_id=MAX(last_observation_id,excluded.last_observation_id)''',
+            (known,),
+        )
 
     def save_paper_state(self, state: dict[str, Any]) -> None:
         now = datetime.now(timezone.utc).isoformat()
@@ -92,7 +111,7 @@ class Storage:
             'features': features.model_dump(mode='json'),
             'forecast': forecast.model_dump(mode='json'),
         }
-        self.db.execute(
+        cur = self.db.execute(
             '''INSERT INTO observations(created_at,ticker,btc_price,market_probability,yes_bid,yes_ask,no_bid,no_ask,
                seconds_remaining,model_probability,confidence,reference_price,reference_source,book_imbalance,wave_score,usable_json)
                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',
@@ -102,6 +121,11 @@ class Storage:
                 forecast.yes_probability, forecast.confidence, features.reference_price, features.reference_source,
                 features.book_imbalance, features.wave_score, json.dumps(payload),
             ),
+        )
+        self.db.execute(
+            '''INSERT INTO market_windows(ticker,first_observation_id,last_observation_id) VALUES(?,?,?)
+               ON CONFLICT(ticker) DO UPDATE SET last_observation_id=excluded.last_observation_id''',
+            (market.ticker, cur.lastrowid, cur.lastrowid),
         )
         self.db.commit()
 
@@ -148,42 +172,40 @@ class Storage:
         return [dict(zip(keys, row)) for row in cur.fetchall()]
 
     def execution_attribution(self, limit: int = 20000) -> dict[str, float | int]:
-        rows = self.db.execute(
-            '''SELECT status,requested_quantity,filled_quantity,gross_edge_before,executable_edge_after,
-               fee,depth_slippage,latency_slippage,total_slippage
-               FROM execution_events WHERE intent='buy' ORDER BY id DESC LIMIT ?''',
+        (
+            attempts, filled_attempts, rejected, no_liquidity, gross_total, executable_total,
+            total_filled, depth_total, latency_total, fee_total,
+        ) = self.db.execute(
+            '''SELECT COUNT(*),COALESCE(SUM(filled_quantity>0),0),COALESCE(SUM(status='rejected'),0),
+               COALESCE(SUM(status='no_liquidity'),0),TOTAL(gross_edge_before),TOTAL(executable_edge_after),
+               COALESCE(SUM(CASE WHEN filled_quantity>0 THEN filled_quantity END),0),
+               TOTAL(CASE WHEN filled_quantity>0 THEN depth_slippage*filled_quantity END),
+               TOTAL(CASE WHEN filled_quantity>0 THEN latency_slippage*filled_quantity END),
+               TOTAL(CASE WHEN filled_quantity>0 THEN fee END)
+               FROM (SELECT status,filled_quantity,gross_edge_before,executable_edge_after,fee,
+                     depth_slippage,latency_slippage
+                     FROM execution_events WHERE intent='buy' ORDER BY id DESC LIMIT ?)''',
             (limit,),
-        ).fetchall()
-        if not rows:
+        ).fetchone()
+        if not attempts:
             return {
                 'entry_attempts': 0,'filled_attempts': 0,'rejected_attempts': 0,'no_liquidity_attempts': 0,
                 'average_gross_edge': 0.0,'average_executable_edge': 0.0,'average_edge_drag': 0.0,
                 'average_depth_slippage': 0.0,'average_latency_slippage': 0.0,'average_fee_per_filled_contract': 0.0,
             }
-        attempts = len(rows)
-        filled_rows = [r for r in rows if int(r[2] or 0) > 0]
-        rejected = sum(1 for r in rows if r[0] == 'rejected')
-        no_liquidity = sum(1 for r in rows if r[0] == 'no_liquidity')
-        gross = sum(float(r[3] or 0.0) for r in rows) / attempts
-        executable = sum(float(r[4] or 0.0) for r in rows) / attempts
-        if filled_rows:
-            total_filled = sum(int(r[2] or 0) for r in filled_rows)
-            depth = sum(float(r[6] or 0.0) * int(r[2] or 0) for r in filled_rows) / total_filled
-            latency = sum(float(r[7] or 0.0) * int(r[2] or 0) for r in filled_rows) / total_filled
-            fees = sum(float(r[5] or 0.0) for r in filled_rows) / total_filled
-        else:
-            depth = latency = fees = 0.0
+        gross = gross_total / attempts
+        executable = executable_total / attempts
         return {
             'entry_attempts': attempts,
-            'filled_attempts': len(filled_rows),
+            'filled_attempts': filled_attempts,
             'rejected_attempts': rejected,
             'no_liquidity_attempts': no_liquidity,
             'average_gross_edge': gross,
             'average_executable_edge': executable,
             'average_edge_drag': gross - executable,
-            'average_depth_slippage': depth,
-            'average_latency_slippage': latency,
-            'average_fee_per_filled_contract': fees,
+            'average_depth_slippage': depth_total / total_filled if total_filled > 0 else 0.0,
+            'average_latency_slippage': latency_total / total_filled if total_filled > 0 else 0.0,
+            'average_fee_per_filled_contract': fee_total / total_filled if total_filled > 0 else 0.0,
         }
 
     def save_market_result(self, ticker: str, result: str, settled_at: str | None = None):
@@ -200,11 +222,25 @@ class Storage:
 
     def unresolved_tickers(self, current_ticker: str = '', limit: int = 10) -> list[str]:
         cur = self.db.execute(
-            '''SELECT DISTINCT o.ticker FROM observations o LEFT JOIN market_results r ON r.ticker=o.ticker
-               WHERE r.ticker IS NULL AND o.ticker<>? ORDER BY o.id DESC LIMIT ?''',
+            '''SELECT w.ticker FROM market_windows w LEFT JOIN market_results r ON r.ticker=w.ticker
+               WHERE r.ticker IS NULL AND w.ticker<>? ORDER BY w.last_observation_id DESC LIMIT ?''',
             (current_ticker, limit),
         )
         return [row[0] for row in cur.fetchall()]
+
+    def completed_window_count(self) -> int:
+        row = self.db.execute(
+            'SELECT COUNT(*) FROM market_windows w JOIN market_results r ON r.ticker=w.ticker'
+        ).fetchone()
+        return int(row[0])
+
+    def labels_version(self) -> tuple[int, int]:
+        """Changes whenever a market is labeled or a labeled market gains observations."""
+        row = self.db.execute(
+            '''SELECT COUNT(*),COALESCE(MAX(w.last_observation_id),0)
+               FROM market_windows w JOIN market_results r ON r.ticker=w.ticker'''
+        ).fetchone()
+        return int(row[0]), int(row[1])
 
     def recent_trades(self, limit: int = 50) -> list[dict]:
         cur = self.db.execute(
@@ -215,29 +251,28 @@ class Storage:
         keys = ['created_at', 'ticker', 'side', 'action', 'quantity', 'requested_quantity', 'price', 'pnl', 'fee', 'slippage', 'reason']
         return [dict(zip(keys, row)) for row in cur.fetchall()]
 
-    def closed_trade_records(self, limit: int = 20000) -> list[dict]:
-        cur = self.db.execute(
-            '''SELECT created_at,ticker,side,action,quantity,requested_quantity,price,pnl,fee,slippage,reason
-               FROM trades WHERE action IN ('close','settle') ORDER BY id DESC LIMIT ?''',
+    def closed_trade_stats(self, limit: int = 20000) -> dict[str, float | int]:
+        closed, realized, wins, gross_profit, losses, gross_loss = self.db.execute(
+            '''SELECT COUNT(*),TOTAL(pnl),COALESCE(SUM(pnl>0),0),TOTAL(CASE WHEN pnl>0 THEN pnl END),
+               COALESCE(SUM(pnl<0),0),TOTAL(CASE WHEN pnl<0 THEN pnl END)
+               FROM (SELECT pnl FROM trades WHERE action IN ('close','settle') ORDER BY id DESC LIMIT ?)''',
             (limit,),
-        )
-        keys = ['created_at', 'ticker', 'side', 'action', 'quantity', 'requested_quantity', 'price', 'pnl', 'fee', 'slippage', 'reason']
-        return [dict(zip(keys, row)) for row in cur.fetchall()]
+        ).fetchone()
+        return {
+            'closed_trades': closed, 'realized_pnl': realized, 'wins': wins,
+            'gross_profit': gross_profit, 'losses': losses, 'gross_loss': gross_loss,
+        }
 
     def execution_metrics(self, limit: int = 20000) -> dict[str, float | int]:
-        rows = self.db.execute(
-            '''SELECT quantity,requested_quantity,fee,slippage FROM trades
-               WHERE action IN ('open','close') ORDER BY id DESC LIMIT ?''',
+        fills, filled, requested, fees, weighted_slippage = self.db.execute(
+            '''SELECT COUNT(*),COALESCE(SUM(quantity),0),COALESCE(SUM(COALESCE(requested_quantity,quantity)),0),
+               TOTAL(fee),TOTAL(slippage*quantity)
+               FROM (SELECT quantity,requested_quantity,fee,slippage FROM trades
+                     WHERE action IN ('open','close') ORDER BY id DESC LIMIT ?)''',
             (limit,),
-        ).fetchall()
-        if not rows:
-            return {'fills':0,'requested_contracts':0,'filled_contracts':0,'fill_rate':0.0,'fees':0.0,'average_slippage':0.0}
-        filled = sum(int(row[0] or 0) for row in rows)
-        requested = sum(int(row[1] if row[1] is not None else row[0] or 0) for row in rows)
-        fees = sum(float(row[2] or 0.0) for row in rows)
-        weighted_slippage = sum(float(row[3] or 0.0) * int(row[0] or 0) for row in rows)
+        ).fetchone()
         return {
-            'fills': len(rows),'requested_contracts': requested,'filled_contracts': filled,
+            'fills': fills,'requested_contracts': requested,'filled_contracts': filled,
             'fill_rate': filled / requested if requested > 0 else 0.0,'fees': fees,
             'average_slippage': weighted_slippage / filled if filled > 0 else 0.0,
         }
@@ -265,9 +300,9 @@ class Storage:
         cur = self.db.execute(
             '''SELECT o.created_at,o.ticker,o.market_probability,o.model_probability,o.seconds_remaining,r.result,
                CASE WHEN r.result='yes' THEN 1.0 ELSE 0.0 END outcome_yes
-               FROM observations o
-               JOIN (SELECT ticker,MAX(id) max_id FROM observations GROUP BY ticker) x ON x.max_id=o.id
-               JOIN market_results r ON r.ticker=o.ticker ORDER BY o.id DESC LIMIT ?''',
+               FROM market_windows w
+               JOIN market_results r ON r.ticker=w.ticker
+               JOIN observations o ON o.id=w.last_observation_id ORDER BY o.id DESC LIMIT ?''',
             (limit,),
         )
         keys = ['created_at', 'ticker', 'market_probability', 'model_probability', 'seconds_remaining', 'result', 'outcome_yes']

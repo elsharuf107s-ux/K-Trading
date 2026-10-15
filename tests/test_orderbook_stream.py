@@ -136,3 +136,26 @@ def test_execution_can_use_empirical_latency_override(monkeypatch):
     assert fill.filled_quantity == 5
     assert fill.latency_slippage == pytest.approx(0.003)
     assert 'empirical latency penalty' in fill.reason
+
+
+def test_empirical_summary_refreshes_incrementally_and_keeps_newest_window(tmp_path):
+    lab = EmpiricalExecutionLab(str(tmp_path / 'incremental.sqlite3'), max_samples=4, cache_seconds=0.0)
+
+    def move(value):
+        return QuoteMove(
+            ticker='T', horizon_ms=250, elapsed_ms=250, yes_ask_move=value, no_ask_move=0.0,
+            captured_at=datetime.now(timezone.utc).isoformat(),
+        )
+
+    lab.save_moves([move(0.01), move(0.01)])
+    assert lab.horizon_summary(250)['samples'] == 2
+    lab.save_moves([move(0.03), move(0.03), move(0.03), move(0.03)])
+    summary = lab.horizon_summary(250)
+    # Only the newest `max_samples` moves count, so the two 0.01 moves age out.
+    assert summary['samples'] == 4
+    assert summary['mean_yes_ask_move'] == pytest.approx(0.03)
+
+    cached = EmpiricalExecutionLab(str(tmp_path / 'incremental.sqlite3'), cache_seconds=60.0)
+    first = cached.horizon_summary(250)
+    cached.save_moves([move(0.50)])
+    assert cached.horizon_summary(250) == first

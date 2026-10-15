@@ -188,7 +188,7 @@ class FastPathController:
             cash=self.engine.paper.cash,
             equity=equity,
             starting_equity=self.engine.paper.starting_cash,
-            daily_pnl=self.engine.paper.realized_pnl,
+            daily_pnl=self.engine.paper.daily_pnl(),
             kill_switch=self.engine.paper.kill_switch,
         )
 
@@ -276,6 +276,7 @@ class FastPathController:
                 'cash': round(self.engine.paper.cash, 4),
                 'equity': round(equity_after, 4),
                 'realized_pnl': round(self.engine.paper.realized_pnl, 4),
+                'daily_realized_pnl': round(self.engine.paper.daily_pnl(), 4),
                 'total_fees': round(self.engine.paper.total_fees, 4),
                 'positions': {k: v.model_dump(mode='json') for k, v in self.engine.paper.positions.items()},
                 'kill_switch': self.engine.paper.kill_switch,

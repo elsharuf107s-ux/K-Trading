@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 import json
 import math
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 from .config import settings
 from .execution import ExecutionSimulator
@@ -71,27 +71,30 @@ class StrategyEvaluator:
             return None
         return data if isinstance(data, dict) else None
 
-    def _completed_windows(self, limit: int = 100_000) -> list[dict[str, Any]]:
-        rows = self.storage.db.execute(
-            '''SELECT o.ticker,o.created_at,o.usable_json,r.result,r.settled_at
-               FROM observations o JOIN market_results r ON r.ticker=o.ticker
-               ORDER BY o.created_at ASC,o.id ASC LIMIT ?''',
-            (int(limit),),
+    def _completed_windows(self) -> Iterator[dict[str, Any]]:
+        """Yield every completed window oldest-first, loading one window's frames at a time."""
+        windows = self.storage.db.execute(
+            '''SELECT w.ticker,r.result,r.settled_at
+               FROM market_windows w JOIN market_results r ON r.ticker=w.ticker
+               ORDER BY w.first_observation_id ASC'''
         ).fetchall()
-        grouped: dict[str, dict[str, Any]] = {}
-        for ticker, created_at, payload, result, settled_at in rows:
-            item = grouped.setdefault(str(ticker), {
-                'ticker': str(ticker),
-                'result': str(result).lower(),
-                'settled_at': settled_at,
-                'frames': [],
-            })
-            try:
-                parsed = json.loads(payload)
-            except Exception:
+        for ticker, result, settled_at in windows:
+            result = str(result).lower()
+            if result not in ('yes', 'no'):
                 continue
-            item['frames'].append({'created_at': str(created_at), **parsed})
-        return [item for item in grouped.values() if item['frames'] and item['result'] in ('yes', 'no')]
+            rows = self.storage.db.execute(
+                'SELECT created_at,usable_json FROM observations WHERE ticker=? ORDER BY created_at ASC,id ASC',
+                (ticker,),
+            ).fetchall()
+            frames = []
+            for created_at, payload in rows:
+                try:
+                    parsed = json.loads(payload)
+                except Exception:
+                    continue
+                frames.append({'created_at': str(created_at), **parsed})
+            if frames:
+                yield {'ticker': str(ticker), 'result': result, 'settled_at': settled_at, 'frames': frames}
 
     @staticmethod
     def _frame(frame: dict[str, Any]) -> tuple[MarketSnapshot, FeatureVector, Forecast] | None:
@@ -327,10 +330,11 @@ class StrategyEvaluator:
         }
 
     def run(self) -> dict[str, Any]:
-        windows = self._completed_windows()
         trades: list[dict[str, Any]] = []
+        completed = 0
         skipped = 0
-        for window in windows:
+        for window in self._completed_windows():
+            completed += 1
             trade = self._replay_window(window)
             if trade is None:
                 skipped += 1
@@ -346,10 +350,10 @@ class StrategyEvaluator:
         equity = self._equity_metrics(trades)
 
         metrics = {
-            'completed_windows': len(windows),
+            'completed_windows': completed,
             'traded_windows': len(trades),
             'skipped_windows': skipped,
-            'trade_rate': _safe_div(len(trades), len(windows)),
+            'trade_rate': _safe_div(len(trades), completed),
             'net_pnl_per_contract_strategy': sum(pnl),
             'average_pnl': _safe_div(sum(pnl), len(pnl)),
             'win_rate': _safe_div(len(wins), len(trades)),
@@ -408,6 +412,11 @@ class ResearchGate:
         brier_gain = analytics.get('brier_improvement_vs_market')
         completed = int(analytics.get('completed_windows') or 0)
         empirical_samples = int(empirical_summary.get('total_samples') or 0)
+        # 0 is a perfect score for these two once trades exist; without
+        # replay trades (or metrics) there is no evidence, so they fail.
+        traded = int(metrics.get('traded_windows') or 0)
+        drawdown = metrics.get('max_drawdown_fraction') if traded else None
+        loss_streak = metrics.get('max_consecutive_losses') if traded else None
 
         gates = [
             {
@@ -418,8 +427,8 @@ class ResearchGate:
             },
             {
                 'name': 'replay_trades',
-                'pass': int(metrics.get('traded_windows') or 0) >= settings.soak_min_replay_trades,
-                'actual': int(metrics.get('traded_windows') or 0),
+                'pass': traded >= settings.soak_min_replay_trades,
+                'actual': traded,
                 'required': settings.soak_min_replay_trades,
             },
             {
@@ -439,14 +448,14 @@ class ResearchGate:
             },
             {
                 'name': 'replay_drawdown',
-                'pass': float(metrics.get('max_drawdown_fraction') or 1.0) <= settings.soak_max_replay_drawdown_fraction,
-                'actual': metrics.get('max_drawdown_fraction'),
+                'pass': drawdown is not None and float(drawdown) <= settings.soak_max_replay_drawdown_fraction,
+                'actual': drawdown,
                 'required': f'<= {settings.soak_max_replay_drawdown_fraction}',
             },
             {
                 'name': 'loss_streak',
-                'pass': int(metrics.get('max_consecutive_losses') or 999999) <= settings.soak_max_consecutive_losses,
-                'actual': metrics.get('max_consecutive_losses'),
+                'pass': loss_streak is not None and int(loss_streak) <= settings.soak_max_consecutive_losses,
+                'actual': loss_streak,
                 'required': f'<= {settings.soak_max_consecutive_losses}',
             },
             {
