@@ -88,6 +88,29 @@ class Settings(BaseSettings):
     soak_min_execution_fill_rate: float = 0.50
     soak_min_empirical_samples: int = 500
 
+    # V0.9 low-latency in-memory decision path. REST discovery/reconciliation
+    # stays on engine_interval_seconds; this loop only consumes already-synced
+    # WebSocket/BRTI state so lowering it does not multiply REST traffic.
+    fast_path_enabled: bool = True
+    fast_path_interval_ms: int = 200
+    fast_path_require_stream: bool = True
+    fast_path_observation_interval_seconds: float = 1.0
+    fast_path_max_slow_state_age_seconds: float = 4.0
+
+    # Optional non-blocking AI/time-series sidecar. The recommended production
+    # sidecar is Amazon Chronos-2 behind a small HTTP service. It never gets
+    # credentials and never executes orders; it only returns a probability vote.
+    ai_sidecar_enabled: bool = False
+    ai_sidecar_url: str = ''
+    ai_sidecar_model: str = 'amazon/chronos-2'
+    ai_sidecar_weight: float = 0.20
+    ai_sidecar_min_confidence: float = 0.55
+    ai_sidecar_request_interval_seconds: float = 5.0
+    ai_sidecar_timeout_seconds: float = 2.0
+    ai_sidecar_max_age_seconds: float = 15.0
+    ai_sidecar_max_probability_shift: float = 0.08
+    ai_sidecar_history_points: int = 256
+
     coinbase_spot_url: str = 'https://api.coinbase.com/v2/prices/BTC-USD/spot'
     kraken_ticker_url: str = 'https://api.kraken.com/0/public/Ticker?pair=XBTUSD'
 
@@ -99,6 +122,10 @@ class Settings(BaseSettings):
     @property
     def has_kalshi_credentials(self) -> bool:
         return bool(self.kalshi_key_id and (self.kalshi_private_key_path or self.kalshi_private_key_pem))
+
+    @property
+    def has_ai_sidecar(self) -> bool:
+        return bool(self.ai_sidecar_enabled and self.ai_sidecar_url.strip())
 
 
 settings = Settings()
