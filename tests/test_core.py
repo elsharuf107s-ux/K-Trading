@@ -122,7 +122,7 @@ def test_cfbenchmarks_message_parser():
     from app.stream import CFBenchmarkStream
     stream = CFBenchmarkStream()
     stream._handle({
-        'type': 'cfbenchmarks_value_5hz',
+        'type': 'cfbenchmarks_value',
         'msg': {
             'index_id': 'BRTI',
             'received_at': 1234567890000,
@@ -133,6 +133,34 @@ def test_cfbenchmarks_message_parser():
     })
     assert stream.latest is not None
     assert stream.latest.value == 100250.50
+    assert stream.latest.avg_60s == 100200.25
+    assert stream.latest.settlement_window_avg == 100210.75
+
+
+def test_5hz_tick_preserves_settlement_averages():
+    from app.stream import CFBenchmarkStream
+    stream = CFBenchmarkStream()
+    stream._handle({
+        'type': 'cfbenchmarks_value',
+        'msg': {
+            'index_id': 'BRTI',
+            'received_at': 1234567890000,
+            'data': '{"value":"100250.50"}',
+            'avg_60s_data': {'value': '100200.25'},
+            'last_60s_windowed_average_15min': {'value': '100210.75'},
+        },
+    })
+    stream._handle({
+        'type': 'cfbenchmarks_value_5hz',
+        'msg': {
+            'index_id': 'BRTI',
+            'received_at': 1234567890100,
+            'value_usd': '100260.75',
+            'data': '{"value":"100260.75"}',
+        },
+    })
+    assert stream.latest is not None
+    assert stream.latest.value == 100260.75
     assert stream.latest.avg_60s == 100200.25
     assert stream.latest.settlement_window_avg == 100210.75
 
