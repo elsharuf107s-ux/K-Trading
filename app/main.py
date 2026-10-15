@@ -25,7 +25,7 @@ async def lifespan(app: FastAPI):
     await engine.stop()
 
 
-app = FastAPI(title='K-Trading', version='0.4.0', lifespan=lifespan)
+app = FastAPI(title='K-Trading', version='0.5.0', lifespan=lifespan)
 
 WEB_DIR = Path(__file__).resolve().parent.parent / 'web'
 if WEB_DIR.exists():
@@ -47,8 +47,10 @@ async def health():
         'ok': True,
         'status': engine.last_state.get('status'),
         'mode': 'paper',
+        'version': app.version,
         'benchmark_stream': engine.benchmark_stream.status(),
         'model_registry': engine.model_registry.status(),
+        'execution': engine.storage.execution_metrics(),
     }
 
 
@@ -60,6 +62,11 @@ async def state():
 @app.get('/api/trades')
 async def trades(limit: int = 50):
     return {'trades': engine.storage.recent_trades(max(1, min(limit, 500)))}
+
+
+@app.get('/api/execution')
+async def execution_metrics():
+    return engine.storage.execution_metrics()
 
 
 @app.get('/api/observations')
