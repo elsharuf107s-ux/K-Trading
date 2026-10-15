@@ -23,11 +23,18 @@ def book_market(**overrides):
     return MarketSnapshot(**base)
 
 
-def test_general_fee_rounds_up_to_cent(monkeypatch):
+def test_general_fee_rounds_position_plus_fee_to_centicent(monkeypatch):
     monkeypatch.setattr(settings, 'sim_taker_fee_rate', 0.07)
-    assert event_contract_fee(1, 0.50) == 0.02
-    assert event_contract_fee(100, 0.50) == 1.75
-    assert event_contract_fee(10, 0.40) == 0.17
+    monkeypatch.setattr(settings, 'sim_taker_fee_multiplier', 1.0)
+    assert round(event_contract_fee(1, 0.50), 4) == 0.0175
+    assert round(event_contract_fee(100, 0.50), 4) == 1.75
+    assert round(event_contract_fee(10, 0.40), 4) == 0.168
+
+
+def test_general_maker_multiplier_defaults_to_zero(monkeypatch):
+    monkeypatch.setattr(settings, 'sim_maker_fee_rate', 0.0175)
+    monkeypatch.setattr(settings, 'sim_maker_fee_multiplier', 0.0)
+    assert event_contract_fee(100, 0.50, maker=True) == 0.0
 
 
 def test_buy_yes_walks_complementary_no_book(monkeypatch):
