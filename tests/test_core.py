@@ -135,3 +135,35 @@ def test_cfbenchmarks_message_parser():
     assert stream.latest.value == 100250.50
     assert stream.latest.avg_60s == 100200.25
     assert stream.latest.settlement_window_avg == 100210.75
+
+
+def test_analytics_brier_and_replay(tmp_path):
+    from app.analytics import ResearchAnalytics
+    from app.storage import Storage
+    path = str(tmp_path / 'research.sqlite3')
+    st = Storage(path)
+    m = market(ticker='KXBTC15M-LABELED')
+    btc = BtcSnapshot(price=100050, sources={'a': 100050})
+    f = build_features(m, btc, PriceBuffer(), MarketBuffer())
+    fc = BaselineForecaster().predict(f)
+    st.save_observation(m, f, fc)
+    st.save_market_result(m.ticker, 'yes')
+    report = ResearchAnalytics(st).summary()
+    assert report['completed_windows'] == 1
+    assert report['model_brier_last_snapshot'] is not None
+    assert len(report['calibration']) == 1
+    replay = st.replay_window(m.ticker)
+    assert replay is not None
+    assert replay['result'] == 'yes'
+    assert len(replay['frames']) == 1
+
+
+def test_unresolved_market_tracking(tmp_path):
+    from app.storage import Storage
+    st = Storage(str(tmp_path / 'labels.sqlite3'))
+    m = market(ticker='KXBTC15M-OLD')
+    f = build_features(m, BtcSnapshot(price=100000, sources={'a': 100000}), PriceBuffer(), MarketBuffer())
+    st.save_observation(m, f, BaselineForecaster().predict(f))
+    assert m.ticker in st.unresolved_tickers('KXBTC15M-CURRENT')
+    st.save_market_result(m.ticker, 'no')
+    assert m.ticker not in st.unresolved_tickers('KXBTC15M-CURRENT')

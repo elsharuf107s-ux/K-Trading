@@ -8,9 +8,11 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
+from .analytics import ResearchAnalytics
 from .engine import TradingEngine
 
 engine = TradingEngine()
+analytics = ResearchAnalytics(engine.storage)
 
 
 @asynccontextmanager
@@ -20,7 +22,7 @@ async def lifespan(app: FastAPI):
     await engine.stop()
 
 
-app = FastAPI(title='K-Trading', version='0.2.0', lifespan=lifespan)
+app = FastAPI(title='K-Trading', version='0.3.0', lifespan=lifespan)
 
 WEB_DIR = Path(__file__).resolve().parent.parent / 'web'
 if WEB_DIR.exists():
@@ -59,6 +61,19 @@ async def trades(limit: int = 50):
 @app.get('/api/observations')
 async def observations(limit: int = 200):
     return {'observations': engine.storage.recent_observations(max(1, min(limit, 2000)))}
+
+
+@app.get('/api/analytics')
+async def research_analytics():
+    return analytics.summary()
+
+
+@app.get('/api/replay/{ticker}')
+async def replay(ticker: str):
+    data = engine.storage.replay_window(ticker)
+    if data is None:
+        raise HTTPException(status_code=404, detail='No recorded observations for that ticker')
+    return data
 
 
 @app.post('/api/cycle')

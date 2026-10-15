@@ -4,9 +4,9 @@ K-Trading is a **paper-trading research engine** for Kalshi's rolling `KXBTC15M`
 
 The goal is to test one thing honestly: whether a short-horizon model can estimate a fair probability better than the live Kalshi market **after spread, fees/cost buffers, execution friction, and risk controls**.
 
-> **V0.2 is paper-only. Real-money order execution is not implemented.**
+> **V0.3 is paper-only. Real-money order execution is not implemented.**
 
-## What V0.2 does
+## What V0.3 does
 
 - Discovers the current `KXBTC15M` market automatically.
 - Reads the live public Kalshi order book and derives YES/NO bid/ask, top depth, spread, and imbalance.
@@ -20,6 +20,9 @@ The goal is to test one thing honestly: whether a short-horizon model can estima
 - Exits on edge decay, wave reversal, stop loss, trailing-profit giveback, or time/reference safety gates.
 - Settles stale paper positions once Kalshi reports the prior market result.
 - Journals observations and trades to SQLite.
+- Labels completed windows with Kalshi YES/NO results.
+- Computes model-vs-market Brier scores and calibration buckets.
+- Replays every recorded frame of a completed 15-minute window without inventing future data.
 - Exposes a localhost/Codespaces dashboard and JSON API.
 
 ## Architecture
@@ -107,6 +110,8 @@ When BRTI is unavailable, K-Trading **blocks new final-minute entries** by defau
 - `GET /api/state`
 - `GET /api/trades`
 - `GET /api/observations`
+- `GET /api/analytics`
+- `GET /api/replay/{ticker}`
 - `POST /api/cycle`
 - `POST /api/kill-switch`
 
@@ -116,7 +121,7 @@ When BRTI is unavailable, K-Trading **blocks new final-minute entries** by defau
 pytest -q
 ```
 
-Current V0.2 test coverage includes:
+Current V0.3 test coverage includes:
 
 - bounded forecast output
 - official BRTI reference preference
@@ -126,11 +131,14 @@ Current V0.2 test coverage includes:
 - paper round-trip accounting
 - paper market settlement
 - CF Benchmarks WebSocket payload parsing
+- completed-window labeling
+- Brier/calibration analytics
+- recorded-window replay
 
 ## Safety / research rules
 
 1. **Paper first.**
-2. No live-order executor exists in V0.2.
+2. No live-order executor exists in V0.3.
 3. Do not judge the system by win rate alone.
 4. Track net P&L after costs, calibration, Brier score, drawdown, edge capture, and performance by regime.
 5. Never use later/final data in historical decisions.
@@ -138,14 +146,6 @@ Current V0.2 test coverage includes:
 7. Kalshi's actual market rules control settlement.
 
 ## Next milestones
-
-### V0.3 — data collector + replay
-- second-level observation capture
-- historical market ingestion
-- deterministic window replay
-- calibration buckets
-- Brier score / expected-value reporting
-- regime performance report
 
 ### V0.4 — model lab
 - logistic-regression baseline

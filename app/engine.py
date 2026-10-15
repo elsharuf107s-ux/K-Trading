@@ -65,11 +65,11 @@ class TradingEngine:
             except asyncio.TimeoutError:
                 pass
 
-    async def _reconcile_old_positions(self, current_ticker: str) -> list:
+    async def _reconcile_completed_markets(self, current_ticker: str) -> list:
         settlements = []
-        for ticker in list(self.paper.positions):
-            if ticker == current_ticker:
-                continue
+        candidates = set(self.storage.unresolved_tickers(current_ticker, limit=8))
+        candidates.update(t for t in self.paper.positions if t != current_ticker)
+        for ticker in candidates:
             try:
                 raw = await self.kalshi.get_market(ticker)
             except Exception:
@@ -77,9 +77,11 @@ class TradingEngine:
             result = str(raw.get('result') or '').lower()
             if result not in ('yes', 'no'):
                 continue
-            trade = self.paper.settle(ticker, result)
-            self.storage.save_trade(trade)
-            settlements.append(trade)
+            self.storage.save_market_result(ticker, result)
+            if ticker in self.paper.positions:
+                trade = self.paper.settle(ticker, result)
+                self.storage.save_trade(trade)
+                settlements.append(trade)
         return settlements
 
     async def cycle(self) -> dict:
@@ -95,7 +97,7 @@ class TradingEngine:
             return self.last_state
 
         market = await self.kalshi.enrich_orderbook(market)
-        settlements = await self._reconcile_old_positions(market.ticker)
+        settlements = await self._reconcile_completed_markets(market.ticker)
 
         btc = await self.btc.get()
         self.buffer.add(btc)
