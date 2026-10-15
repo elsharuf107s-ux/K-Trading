@@ -42,11 +42,19 @@ class Settings(BaseSettings):
     daily_loss_limit_usd: float = 50.0
     max_drawdown_fraction: float = 0.10
 
+    # V0.4 model lab. A learned model can only become champion after grouped,
+    # chronological out-of-sample evaluation beats the live-market baseline.
+    model_dir: str = 'data/models'
+    enable_learned_model: bool = True
+    model_min_windows: int = 24
+    model_min_brier_gain: float = 0.002
+
     coinbase_spot_url: str = 'https://api.coinbase.com/v2/prices/BTC-USD/spot'
     kraken_ticker_url: str = 'https://api.kraken.com/0/public/Ticker?pair=XBTUSD'
 
     def ensure_dirs(self) -> None:
         Path(self.database_path).parent.mkdir(parents=True, exist_ok=True)
+        Path(self.model_dir).mkdir(parents=True, exist_ok=True)
 
     @property
     def has_kalshi_credentials(self) -> bool:
