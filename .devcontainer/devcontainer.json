@@ -1,0 +1,9 @@
+{
+  "name": "K-Trading",
+  "image": "mcr.microsoft.com/devcontainers/python:3.12",
+  "forwardPorts": [8000],
+  "postCreateCommand": "pip install -r requirements.txt",
+  "portsAttributes": {
+    "8000": { "label": "K-Trading Dashboard", "onAutoForward": "openPreview" }
+  }
+}
