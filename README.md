@@ -2,92 +2,86 @@
 
 K-Trading is a **paper-only research and learning engine** for Kalshi's rolling `KXBTC15M` Bitcoin markets.
 
-The goal is not to maximize win rate. The goal is to determine whether a probability model can beat the live Kalshi probability **out-of-sample and after spread, cost buffers, execution friction, and hard risk controls**.
+The goal is not to maximize win rate. The goal is to determine whether a probability model can beat the live Kalshi market **out-of-sample and after spread, fees, depth, latency, slippage, partial fills, and hard risk controls**.
 
-> **Status: V0.4 / paper trading only. Real-money order execution is not implemented.**
+> **Status: V0.5 / paper trading only. Real-money order execution is not implemented.**
 
-## What V0.4 does
+## What V0.5 does
 
 ### Live research engine
 - Discovers the current `KXBTC15M` market.
-- Reads the public Kalshi order book and derives YES/NO bid/ask, depth, spread, and imbalance.
+- Reads Kalshi's public YES/NO bid order book and preserves visible depth.
+- Derives opposite-side asks from binary-market complement prices.
 - Reads Coinbase + Kraken as spot cross-checks.
 - Optionally authenticates to Kalshi WebSocket data and streams CF Benchmarks `BRTI`.
 - Uses BRTI as the primary reference and momentum source when available.
 - Uses the 15-minute settlement-window average during the final minute when supplied by the feed.
 - Builds BTC/BRTI momentum, Kalshi probability momentum, order-book imbalance, target distance, and a wave score.
-- Produces a fair YES probability and compares it with Kalshi after friction buffers.
 - Enforces hard spread, expiry, bankroll, drawdown, stop, trailing-profit, wave-alignment, and kill-switch rules.
-- Persists paper cash, positions, realized P&L, and kill-switch state through restarts.
-- Reconciles completed markets and settles stale paper positions from Kalshi's result.
 
-### Research / replay layer
-- Stores point-in-time observations in SQLite.
-- Labels completed windows with final YES/NO results.
-- Computes model-vs-market Brier score and calibration buckets.
-- Replays recorded 15-minute windows frame-by-frame without future-data injection.
+### V0.5 execution simulator
+- Walks visible Kalshi depth instead of filling the full order at the displayed best quote.
+- Converts NO bids into executable YES asks and YES bids into executable NO asks.
+- Supports partial fills when visible depth is insufficient.
+- Applies configurable adverse latency drift.
+- Applies configurable general taker/maker fee rates and multipliers.
+- Uses the July 2026 general event-contract fee rounding rule: fee plus position cost is rounded up to a centicent (`$0.0001`).
+- Re-checks entry edge **after** simulated price impact, fees, and latency.
+- Rejects new entries when executable edge falls below the strategy threshold.
+- On risk exits, sells only the visible quantity rather than inventing a full fill.
+- Tracks requested quantity, filled quantity, average fill price, fee, slippage, fill rate, and cumulative fee drag.
+- Keeps entry fees in position cost basis so partial exits and settlement P&L stay internally consistent.
 
-### V0.4 Model Lab
+Fee schedules can change and some series have special multipliers. V0.5 therefore exposes fee rates/multipliers through environment settings instead of hard-wiring them into strategy logic.
+
+### V0.4 Model Lab retained
 - Builds training data only from **completed** markets.
 - Keeps all snapshots from one market window on the same side of a train/test split.
 - Uses chronological expanding walk-forward validation rather than random row splitting.
-- Gives each market equal total sample weight so windows with more captured snapshots do not dominate training.
-- Trains a standardized logistic-regression baseline.
-- Trains a histogram gradient-boosting challenger.
-- Scores both on Brier score and log loss against the live Kalshi market probability baseline.
-- Uses a disjoint recent holdout for sigmoid probability calibration.
-- Saves candidates locally under `data/models/`.
-- Promotes a model to `champion` only when its out-of-sample Brier score clears the configured market-improvement threshold and beats the existing champion.
-- Automatically uses the promoted champion in the paper engine; otherwise it falls back to the deterministic wave-aware baseline.
+- Gives each market equal total sample weight.
+- Trains logistic-regression and histogram-gradient-boosting candidates.
+- Scores candidates on Brier score/log loss against Kalshi's market probability.
+- Uses a disjoint recent holdout for probability calibration.
+- Promotes a model only after configured out-of-sample improvement and champion checks.
+- Automatically falls back to the deterministic wave model when there is no eligible champion.
 
-## Learning architecture
+## Core loop
 
 ```text
-COMPLETED KXBTC15M WINDOWS
-           |
-           v
- Point-in-time snapshots
-           |
-           v
- Group by market ticker
-           |
-           v
- chronological walk-forward
-           |
-      +----+----+
-      |         |
-      v         v
- Logistic    HistGradient
- baseline     challenger
-      |         |
-      +----+----+
-           |
-           v
- OOS Brier / log-loss
-           |
-     compare to Kalshi
-           |
-           v
- recent calibration holdout
-           |
-           v
-   candidate registry
-           |
-   promotion rules pass?
-       /          \
-     no            yes
-     |              |
- candidate only   CHAMPION
-                    |
-                    v
-             paper forecaster
+KALSHI KXBTC15M + BRTI + SPOT
+              |
+              v
+         feature engine
+              |
+              v
+       probability model
+              |
+              v
+        hard risk gate
+              |
+              v
+     desired order quantity
+              |
+              v
+      EXECUTION SIMULATOR
+       /      |       \
+    depth    fees    latency
+      |        |        |
+      +--------+--------+
+              |
+              v
+      executable edge gate
+          /          \
+       reject         fill
+                       |
+                  partial/full
+                       |
+                       v
+                  paper broker
+                       |
+                       v
+              SQLite + analytics
 ```
-
-## Why the split is by market, not by row
-
-A single 15-minute contract generates many snapshots. Randomly splitting individual rows would leak information because early snapshots from a market could land in training while later snapshots from that exact same market land in testing.
-
-V0.4 orders completed market tickers by time and moves **whole windows** between training and testing. This is intentionally stricter than ordinary random cross-validation.
 
 ## Run in Codespaces / Linux
 
@@ -107,7 +101,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 
 ## Official BRTI stream
 
-Kalshi WebSocket market/reference data requires API authentication. Keep the private key outside Git.
+Keep the Kalshi private key outside Git:
 
 ```env
 KALSHI_KEY_ID=your-key-id
@@ -116,13 +110,9 @@ ENABLE_KALSHI_WS=true
 CFBENCHMARKS_INDEX_ID=BRTI
 ```
 
-`KALSHI_PRIVATE_KEY_PEM` is supported too, but an external secret/file is preferable.
-
 Without a fresh BRTI feed, K-Trading falls back to Coinbase/Kraken for research features and **blocks new final-minute entries**.
 
 ## Model Lab settings
-
-Defaults:
 
 ```env
 MODEL_DIR=data/models
@@ -131,27 +121,31 @@ MODEL_MIN_WINDOWS=24
 MODEL_MIN_BRIER_GAIN=0.002
 ```
 
-`MODEL_MIN_WINDOWS` is intentionally only a development floor. Twenty-four 15-minute windows is nowhere near enough evidence to conclude that a strategy has durable real-world edge. The purpose of the low initial gate is to exercise the research pipeline while the database grows.
+`MODEL_MIN_WINDOWS=24` is a development floor, not evidence of durable edge. The research target is hundreds to thousands of independent completed windows.
 
-Model artifacts are ignored by Git and stay local to the running Codespace/machine unless you intentionally export them.
+## V0.5 execution settings
 
-## Train the model lab
-
-Once enough completed markets have been recorded:
-
-```bash
-curl -X POST http://localhost:8000/api/model-lab/train
+```env
+EXECUTION_BOOK_DEPTH=20
+SIM_TAKER_FEE_RATE=0.07
+SIM_TAKER_FEE_MULTIPLIER=1.0
+SIM_MAKER_FEE_RATE=0.0175
+SIM_MAKER_FEE_MULTIPLIER=0.0
+SIM_LATENCY_MS=250
+SIM_LATENCY_PRICE_DRIFT_PER_SECOND=0.004
+SIM_MAX_LATENCY_SLIPPAGE=0.01
+SIM_MAX_EXECUTION_SLIPPAGE=0.03
+SIM_MIN_FILL_FRACTION=0.25
 ```
 
-The response reports each candidate's walk-forward metrics, which candidate won, whether it beat Kalshi, and whether it was promoted.
-
-A failed/rejected candidate does **not** replace the current champion.
+The current strategy submits simulated **taker** orders. Maker-rate settings are present for later passive-order experiments; a zero maker multiplier means no generic maker fee is assumed unless the applicable fee schedule says otherwise.
 
 ## Main API routes
 
 - `GET /api/health`
 - `GET /api/state`
 - `GET /api/trades`
+- `GET /api/execution`
 - `GET /api/observations`
 - `GET /api/analytics`
 - `GET /api/model-lab`
@@ -167,40 +161,44 @@ pytest -q
 ```
 
 Coverage includes:
-
-- bounded forecast output
-- official BRTI preference and BRTI momentum
+- BRTI/reference and wave features
 - settlement-window reference selection
-- spread and final-minute reference guards
+- risk and final-minute guards
 - paper accounting, settlement, and restart persistence
-- CF Benchmarks WebSocket parsing
-- completed-window labeling and replay
+- CF Benchmarks payload parsing
+- completed-window labeling/replay
 - Brier/calibration analytics
-- refusal to train on too few completed markets
-- synthetic grouped walk-forward training
-- champion promotion only after out-of-sample Brier improvement
+- grouped walk-forward model promotion
+- centicent fee rounding
+- complementary YES/NO order-book execution
+- multi-level price impact
+- partial fills and partial exits
+- fee-aware P&L/cost basis
+- SQLite migration for execution fields
+- fill-rate/slippage execution metrics
 
 ## Safety / research rules
 
 1. **Paper first.**
-2. Real-money order execution does not exist in V0.4.
+2. Real-money order execution does not exist in V0.5.
 3. Never optimize primarily for win rate.
-4. Track net P&L after costs, Brier score, calibration, drawdown, edge capture, and regime performance.
-5. Never use future or settlement data in a historical decision frame.
-6. Keep complete market windows isolated across training/testing boundaries.
+4. Judge results after fees, spread, latency, slippage, and incomplete fills.
+5. Never inject future/settlement data into a historical decision frame.
+6. Keep entire market windows isolated across model train/test boundaries.
 7. A candidate that cannot beat the live-market probability baseline out-of-sample does not get promoted.
 8. A backtest or paper result is not proof of future profitability.
-9. Kalshi's actual contract rules control settlement.
+9. Kalshi's actual contract rules and current fee schedule control; simulator settings must be kept current.
 
-## Next milestone — V0.5 execution simulator
+## Next milestone — V0.6 shadow/live-readiness lab
 
-- order-book-depth-aware fills
-- partial fills
-- configurable API/network latency
-- current Kalshi fee model
-- slippage curves
-- maker vs taker simulation where applicable
-- execution-quality attribution
-- strategy P&L separated from fill/slippage P&L
+- record full-depth book snapshots around every decision
+- measure real quote movement over configurable latency horizons
+- replace synthetic latency drift with empirical slippage distributions
+- model queue position for passive maker orders
+- maker-vs-taker strategy experiments
+- decompose model alpha vs execution drag per trade
+- data-feed health scoring and stale-book rejection
+- automatic model retraining schedule after enough new completed windows
+- longer paper soak tests and failure-injection tests
 
-Real execution remains gated until the research stack demonstrates durable out-of-sample behavior across a much larger number of completed markets.
+Real execution stays gated until the research stack demonstrates durable out-of-sample behavior and the execution simulator survives long-running paper tests.
