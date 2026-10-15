@@ -60,3 +60,57 @@ def test_market_result_does_not_guess_unsettled_or_nonbinary_value():
     })
     assert unresolved is None
     assert nonbinary is None
+
+
+def test_daily_loss_limit_resets_on_a_new_utc_day():
+    from datetime import datetime, timedelta, timezone
+
+    from app.paper import PaperBroker
+
+    broker = PaperBroker(1000)
+    broker.open('T1', 'yes', 100, 0.60, 'test')
+    broker.close('T1', 0.05, 'loss')
+    assert round(broker.realized_pnl, 2) == -55.00
+    assert round(broker.daily_pnl(), 2) == -55.00
+    # Lifetime realized P&L must not keep the daily limit tripped forever.
+    tomorrow = datetime.now(timezone.utc) + timedelta(days=1)
+    assert broker.daily_pnl(tomorrow) == 0.0
+    assert round(broker.realized_pnl, 2) == -55.00
+
+
+def test_daily_pnl_survives_restart_and_restores_legacy_state():
+    from app.paper import PaperBroker
+
+    first = PaperBroker(1000)
+    first.open('T1', 'yes', 10, 0.50, 'test')
+    first.settle('T1', 'no')
+    second = PaperBroker(1000)
+    second.restore(first.snapshot())
+    assert round(second.daily_pnl(), 2) == -5.00
+
+    legacy = first.snapshot()
+    legacy.pop('daily_pnl_date')
+    legacy.pop('daily_realized_pnl')
+    third = PaperBroker(1000)
+    third.restore(legacy)
+    assert third.daily_pnl() == 0.0
+    assert round(third.realized_pnl, 2) == -5.00
+
+
+def test_research_gate_passes_zero_losses_and_zero_drawdown(tmp_path):
+    from app.storage import Storage
+    from app.strategy_eval import ResearchGate, StrategyEvaluator
+
+    storage = Storage(str(tmp_path / 'gate.sqlite3'))
+    gate = ResearchGate(storage, StrategyEvaluator(storage, tmp_path / 'eval.json'))
+    perfect = {'metrics': {'traded_windows': 60, 'max_drawdown_fraction': 0.0, 'max_consecutive_losses': 0}}
+    gates = {g['name']: g for g in gate.evaluate({}, {}, strategy_report=perfect)['gates']}
+    assert gates['loss_streak']['pass'] is True
+    assert gates['replay_drawdown']['pass'] is True
+
+    # Missing metrics (no replay run yet) or zero replay trades must still fail closed.
+    no_evidence = [{}, {'traded_windows': 0, 'max_drawdown_fraction': 0.0, 'max_consecutive_losses': 0}]
+    for metrics in no_evidence:
+        gates = {g['name']: g for g in gate.evaluate({}, {}, strategy_report={'metrics': metrics})['gates']}
+        assert gates['loss_streak']['pass'] is False
+        assert gates['replay_drawdown']['pass'] is False

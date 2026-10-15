@@ -1,8 +1,13 @@
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Any
 
-from .models import ExecutionFill, PaperPosition, TradeRecord
+from .models import ExecutionFill, PaperPosition, TradeRecord, utc_now
+
+
+def _utc_date(now: datetime | None = None) -> str:
+    return (now or utc_now()).date().isoformat()
 
 
 class PaperBroker:
@@ -12,6 +17,9 @@ class PaperBroker:
         self.positions: dict[str, PaperPosition] = {}
         self.realized_pnl = 0.0
         self.total_fees = 0.0
+        # Realized P&L booked during one UTC day; feeds the daily loss limit.
+        self.daily_pnl_date = _utc_date()
+        self.daily_realized_pnl = 0.0
         self.trades: list[TradeRecord] = []
         self.kill_switch = False
 
@@ -20,6 +28,8 @@ class PaperBroker:
             'starting_cash': self.starting_cash,
             'cash': self.cash,
             'realized_pnl': self.realized_pnl,
+            'daily_pnl_date': self.daily_pnl_date,
+            'daily_realized_pnl': self.daily_realized_pnl,
             'total_fees': self.total_fees,
             'kill_switch': self.kill_switch,
             'positions': {
@@ -34,6 +44,9 @@ class PaperBroker:
         self.starting_cash = float(state.get('starting_cash', self.starting_cash))
         self.cash = float(state.get('cash', self.starting_cash))
         self.realized_pnl = float(state.get('realized_pnl', 0.0))
+        # States saved before daily tracking existed start today's count at 0.
+        self.daily_pnl_date = str(state.get('daily_pnl_date') or _utc_date())
+        self.daily_realized_pnl = float(state.get('daily_realized_pnl', 0.0))
         self.total_fees = float(state.get('total_fees', 0.0))
         self.kill_switch = bool(state.get('kill_switch', False))
         restored: dict[str, PaperPosition] = {}
@@ -44,6 +57,18 @@ class PaperBroker:
                 continue
             restored[ticker] = position
         self.positions = restored
+
+    def daily_pnl(self, now: datetime | None = None) -> float:
+        """Realized P&L booked so far on the current UTC day."""
+        return self.daily_realized_pnl if _utc_date(now) == self.daily_pnl_date else 0.0
+
+    def _book_realized(self, pnl: float) -> None:
+        today = _utc_date()
+        if today != self.daily_pnl_date:
+            self.daily_pnl_date = today
+            self.daily_realized_pnl = 0.0
+        self.realized_pnl += pnl
+        self.daily_realized_pnl += pnl
 
     def open_fill(self, fill: ExecutionFill, reason: str) -> TradeRecord:
         if fill.intent != 'buy':
@@ -104,7 +129,7 @@ class PaperBroker:
         pnl = gross_proceeds - basis - entry_fee_alloc - exit_fee
 
         self.cash += cash_proceeds
-        self.realized_pnl += pnl
+        self._book_realized(pnl)
         self.total_fees += exit_fee
         pos.quantity -= quantity
         pos.entry_fee = max(0.0, pos.entry_fee - entry_fee_alloc)
@@ -167,7 +192,7 @@ class PaperBroker:
         cost = pos.quantity * pos.entry_price
         pnl = proceeds - cost - pos.entry_fee
         self.cash += proceeds
-        self.realized_pnl += pnl
+        self._book_realized(pnl)
         trade = TradeRecord(
             ticker=ticker,
             side=pos.side,

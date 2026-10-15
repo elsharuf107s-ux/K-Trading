@@ -445,7 +445,7 @@ class TradingEngine:
             cash=self.paper.cash,
             equity=equity,
             starting_equity=self.paper.starting_cash,
-            daily_pnl=self.paper.realized_pnl,
+            daily_pnl=self.paper.daily_pnl(),
             kill_switch=self.paper.kill_switch,
         )
 
@@ -525,6 +525,7 @@ class TradingEngine:
                 'cash': round(self.paper.cash, 4),
                 'equity': round(equity_after, 4),
                 'realized_pnl': round(self.paper.realized_pnl, 4),
+                'daily_realized_pnl': round(self.paper.daily_pnl(), 4),
                 'total_fees': round(self.paper.total_fees, 4),
                 'positions': {k: v.model_dump(mode='json') for k, v in self.paper.positions.items()},
                 'kill_switch': self.paper.kill_switch,

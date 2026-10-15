@@ -408,6 +408,11 @@ class ResearchGate:
         brier_gain = analytics.get('brier_improvement_vs_market')
         completed = int(analytics.get('completed_windows') or 0)
         empirical_samples = int(empirical_summary.get('total_samples') or 0)
+        # 0 is a perfect score for these two once trades exist; without
+        # replay trades (or metrics) there is no evidence, so they fail.
+        traded = int(metrics.get('traded_windows') or 0)
+        drawdown = metrics.get('max_drawdown_fraction') if traded else None
+        loss_streak = metrics.get('max_consecutive_losses') if traded else None
 
         gates = [
             {
@@ -418,8 +423,8 @@ class ResearchGate:
             },
             {
                 'name': 'replay_trades',
-                'pass': int(metrics.get('traded_windows') or 0) >= settings.soak_min_replay_trades,
-                'actual': int(metrics.get('traded_windows') or 0),
+                'pass': traded >= settings.soak_min_replay_trades,
+                'actual': traded,
                 'required': settings.soak_min_replay_trades,
             },
             {
@@ -439,14 +444,14 @@ class ResearchGate:
             },
             {
                 'name': 'replay_drawdown',
-                'pass': float(metrics.get('max_drawdown_fraction') or 1.0) <= settings.soak_max_replay_drawdown_fraction,
-                'actual': metrics.get('max_drawdown_fraction'),
+                'pass': drawdown is not None and float(drawdown) <= settings.soak_max_replay_drawdown_fraction,
+                'actual': drawdown,
                 'required': f'<= {settings.soak_max_replay_drawdown_fraction}',
             },
             {
                 'name': 'loss_streak',
-                'pass': int(metrics.get('max_consecutive_losses') or 999999) <= settings.soak_max_consecutive_losses,
-                'actual': metrics.get('max_consecutive_losses'),
+                'pass': loss_streak is not None and int(loss_streak) <= settings.soak_max_consecutive_losses,
+                'actual': loss_streak,
                 'required': f'<= {settings.soak_max_consecutive_losses}',
             },
             {
