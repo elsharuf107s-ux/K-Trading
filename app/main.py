@@ -25,7 +25,7 @@ async def lifespan(app: FastAPI):
     await engine.stop()
 
 
-app = FastAPI(title='K-Trading', version='0.6.0', lifespan=lifespan)
+app = FastAPI(title='K-Trading', version='0.7.0', lifespan=lifespan)
 
 WEB_DIR = Path(__file__).resolve().parent.parent / 'web'
 if WEB_DIR.exists():
@@ -49,10 +49,13 @@ async def health():
         'mode': 'paper',
         'version': app.version,
         'benchmark_stream': engine.benchmark_stream.status(),
+        'orderbook_stream': engine.orderbook_stream.status(),
         'data_health': engine.last_state.get('data_health'),
         'model_registry': engine.model_registry.status(),
+        'auto_training': engine.last_state.get('auto_training'),
         'execution': engine.storage.execution_metrics(),
         'execution_attribution': engine.storage.execution_attribution(),
+        'empirical_latency': engine.last_state.get('empirical_latency_model'),
     }
 
 
@@ -71,12 +74,26 @@ async def execution_metrics():
     return {
         'fills': engine.storage.execution_metrics(),
         'attribution': engine.storage.execution_attribution(),
+        'empirical': engine.empirical.summary(engine.orderbook_stream.horizons_ms),
+        'latency_model': engine.empirical.recommended_adverse_slippage(
+            engine.orderbook_stream.horizons_ms[0] if not engine.last_state.get('empirical_latency_model') else engine.last_state['empirical_latency_model'].get('requested_latency_ms', 250),
+        ),
     }
 
 
 @app.get('/api/execution-events')
 async def execution_events(limit: int = 100):
     return {'events': engine.storage.recent_execution_events(max(1, min(limit, 2000)))}
+
+
+@app.get('/api/empirical-execution')
+async def empirical_execution():
+    return {
+        'stream': engine.orderbook_stream.status(),
+        'summary': engine.empirical.summary(engine.orderbook_stream.horizons_ms),
+        'latency_model': engine.last_state.get('empirical_latency_model') or engine._latency_model(),
+        'enabled_for_simulation': bool(engine.last_state.get('empirical_latency_enabled')),
+    }
 
 
 @app.get('/api/observations')
@@ -91,7 +108,10 @@ async def research_analytics():
 
 @app.get('/api/model-lab')
 async def model_lab_status():
-    return engine.model_registry.status()
+    return {
+        **engine.model_registry.status(),
+        'auto_training': engine.last_state.get('auto_training') or engine._auto_train_state,
+    }
 
 
 @app.post('/api/model-lab/train')
