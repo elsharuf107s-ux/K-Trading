@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from .models import FeatureVector, Forecast, MarketSnapshot, TradeRecord
+from .models import ExecutionEvent, FeatureVector, Forecast, MarketSnapshot, TradeRecord
 
 
 class Storage:
@@ -25,6 +25,13 @@ class Storage:
             id INTEGER PRIMARY KEY AUTOINCREMENT,created_at TEXT NOT NULL,ticker TEXT NOT NULL,side TEXT NOT NULL,
             action TEXT NOT NULL,quantity INTEGER NOT NULL,price REAL NOT NULL,pnl REAL NOT NULL,
             fee REAL NOT NULL DEFAULT 0,requested_quantity INTEGER,slippage REAL NOT NULL DEFAULT 0,reason TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS execution_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,created_at TEXT NOT NULL,ticker TEXT NOT NULL,side TEXT NOT NULL,
+            intent TEXT NOT NULL,status TEXT NOT NULL,requested_quantity INTEGER NOT NULL,filled_quantity INTEGER NOT NULL,
+            fair_probability REAL NOT NULL,top_price REAL NOT NULL,average_price REAL NOT NULL,
+            gross_edge_before REAL NOT NULL,executable_edge_after REAL NOT NULL,fee REAL NOT NULL,
+            depth_slippage REAL NOT NULL,latency_slippage REAL NOT NULL,total_slippage REAL NOT NULL,reason TEXT NOT NULL
         );
         CREATE TABLE IF NOT EXISTS market_results (
             ticker TEXT PRIMARY KEY,result TEXT NOT NULL,settled_at TEXT NOT NULL
@@ -109,6 +116,76 @@ class Storage:
         )
         self.db.commit()
 
+    def save_execution_event(self, event: ExecutionEvent) -> None:
+        self.db.execute(
+            '''INSERT INTO execution_events(
+               created_at,ticker,side,intent,status,requested_quantity,filled_quantity,fair_probability,
+               top_price,average_price,gross_edge_before,executable_edge_after,fee,depth_slippage,
+               latency_slippage,total_slippage,reason)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',
+            (
+                event.created_at.isoformat(), event.ticker, event.side, event.intent, event.status,
+                event.requested_quantity, event.filled_quantity, event.fair_probability,
+                event.top_price, event.average_price, event.gross_edge_before, event.executable_edge_after,
+                event.fee, event.depth_slippage, event.latency_slippage, event.total_slippage, event.reason,
+            ),
+        )
+        self.db.commit()
+
+    def recent_execution_events(self, limit: int = 100) -> list[dict]:
+        cur = self.db.execute(
+            '''SELECT created_at,ticker,side,intent,status,requested_quantity,filled_quantity,fair_probability,
+               top_price,average_price,gross_edge_before,executable_edge_after,fee,depth_slippage,
+               latency_slippage,total_slippage,reason
+               FROM execution_events ORDER BY id DESC LIMIT ?''',
+            (limit,),
+        )
+        keys = [
+            'created_at','ticker','side','intent','status','requested_quantity','filled_quantity','fair_probability',
+            'top_price','average_price','gross_edge_before','executable_edge_after','fee','depth_slippage',
+            'latency_slippage','total_slippage','reason',
+        ]
+        return [dict(zip(keys, row)) for row in cur.fetchall()]
+
+    def execution_attribution(self, limit: int = 20000) -> dict[str, float | int]:
+        rows = self.db.execute(
+            '''SELECT status,requested_quantity,filled_quantity,gross_edge_before,executable_edge_after,
+               fee,depth_slippage,latency_slippage,total_slippage
+               FROM execution_events WHERE intent='buy' ORDER BY id DESC LIMIT ?''',
+            (limit,),
+        ).fetchall()
+        if not rows:
+            return {
+                'entry_attempts': 0,'filled_attempts': 0,'rejected_attempts': 0,'no_liquidity_attempts': 0,
+                'average_gross_edge': 0.0,'average_executable_edge': 0.0,'average_edge_drag': 0.0,
+                'average_depth_slippage': 0.0,'average_latency_slippage': 0.0,'average_fee_per_filled_contract': 0.0,
+            }
+        attempts = len(rows)
+        filled_rows = [r for r in rows if int(r[2] or 0) > 0]
+        rejected = sum(1 for r in rows if r[0] == 'rejected')
+        no_liquidity = sum(1 for r in rows if r[0] == 'no_liquidity')
+        gross = sum(float(r[3] or 0.0) for r in rows) / attempts
+        executable = sum(float(r[4] or 0.0) for r in rows) / attempts
+        if filled_rows:
+            total_filled = sum(int(r[2] or 0) for r in filled_rows)
+            depth = sum(float(r[6] or 0.0) * int(r[2] or 0) for r in filled_rows) / total_filled
+            latency = sum(float(r[7] or 0.0) * int(r[2] or 0) for r in filled_rows) / total_filled
+            fees = sum(float(r[5] or 0.0) for r in filled_rows) / total_filled
+        else:
+            depth = latency = fees = 0.0
+        return {
+            'entry_attempts': attempts,
+            'filled_attempts': len(filled_rows),
+            'rejected_attempts': rejected,
+            'no_liquidity_attempts': no_liquidity,
+            'average_gross_edge': gross,
+            'average_executable_edge': executable,
+            'average_edge_drag': gross - executable,
+            'average_depth_slippage': depth,
+            'average_latency_slippage': latency,
+            'average_fee_per_filled_contract': fees,
+        }
+
     def save_market_result(self, ticker: str, result: str, settled_at: str | None = None):
         result = result.lower()
         if result not in ('yes', 'no'):
@@ -154,24 +231,14 @@ class Storage:
             (limit,),
         ).fetchall()
         if not rows:
-            return {
-                'fills': 0,
-                'requested_contracts': 0,
-                'filled_contracts': 0,
-                'fill_rate': 0.0,
-                'fees': 0.0,
-                'average_slippage': 0.0,
-            }
+            return {'fills':0,'requested_contracts':0,'filled_contracts':0,'fill_rate':0.0,'fees':0.0,'average_slippage':0.0}
         filled = sum(int(row[0] or 0) for row in rows)
         requested = sum(int(row[1] if row[1] is not None else row[0] or 0) for row in rows)
         fees = sum(float(row[2] or 0.0) for row in rows)
         weighted_slippage = sum(float(row[3] or 0.0) * int(row[0] or 0) for row in rows)
         return {
-            'fills': len(rows),
-            'requested_contracts': requested,
-            'filled_contracts': filled,
-            'fill_rate': filled / requested if requested > 0 else 0.0,
-            'fees': fees,
+            'fills': len(rows),'requested_contracts': requested,'filled_contracts': filled,
+            'fill_rate': filled / requested if requested > 0 else 0.0,'fees': fees,
             'average_slippage': weighted_slippage / filled if filled > 0 else 0.0,
         }
 
