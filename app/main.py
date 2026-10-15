@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse
+from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -47,7 +47,14 @@ class KillSwitchRequest(BaseModel):
 
 @app.get('/')
 async def dashboard():
-    return FileResponse(WEB_DIR / 'index.html')
+    html = (WEB_DIR / 'index.html').read_text(encoding='utf-8')
+    html = html.replace(
+        '<span class="pill">V0.8</span>',
+        '<span class="pill">V0.9</span><span class="pill" id="fastBadge">FAST —</span>',
+        1,
+    )
+    html = html.replace('</body>', '<script src="/static/v09.js"></script></body>', 1)
+    return HTMLResponse(html)
 
 
 def _json_safe(value: Any) -> Any:
