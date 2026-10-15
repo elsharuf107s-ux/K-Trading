@@ -66,6 +66,15 @@ class Settings(BaseSettings):
     max_source_dispersion: float = 0.003
     max_market_snapshot_age_seconds: float = 5.0
 
+    # V0.7 empirical execution learning. Sub-second measurements come from the
+    # authenticated orderbook_delta stream rather than aggressive REST polling.
+    orderbook_stream_stale_seconds: float = 2.0
+    empirical_quote_horizons_ms: str = '100,250,500,1000'
+    empirical_latency_min_samples: int = 200
+    use_empirical_latency: bool = False
+    auto_model_train: bool = True
+    auto_train_every_windows: int = 16
+
     coinbase_spot_url: str = 'https://api.coinbase.com/v2/prices/BTC-USD/spot'
     kraken_ticker_url: str = 'https://api.kraken.com/0/public/Ticker?pair=XBTUSD'
 
