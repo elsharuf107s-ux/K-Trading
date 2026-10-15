@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import math
 from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import Any
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
@@ -28,7 +30,7 @@ async def lifespan(app: FastAPI):
     await engine.stop()
 
 
-app = FastAPI(title='K-Trading', version='0.8.0', lifespan=lifespan)
+app = FastAPI(title='K-Trading', version='0.8.1', lifespan=lifespan)
 
 WEB_DIR = Path(__file__).resolve().parent.parent / 'web'
 if WEB_DIR.exists():
@@ -44,6 +46,22 @@ async def dashboard():
     return FileResponse(WEB_DIR / 'index.html')
 
 
+def _json_safe(value: Any) -> Any:
+    """Recursively remove values that strict JSON encoders cannot serialize.
+
+    Starlette/FastAPI intentionally reject NaN and +/-Infinity. Research metrics
+    can occasionally produce one of those values on tiny/degenerate samples,
+    so convert them to null instead of letting the response terminate mid-body.
+    """
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, dict):
+        return {str(key): _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item) for item in value]
+    return value
+
+
 def _gate_payload(strategy_report=None):
     return research_gate.evaluate(
         analytics.summary(),
@@ -54,7 +72,7 @@ def _gate_payload(strategy_report=None):
 
 @app.get('/api/health')
 async def health():
-    return {
+    return _json_safe({
         'ok': True,
         'status': engine.last_state.get('status'),
         'mode': 'paper',
@@ -68,67 +86,67 @@ async def health():
         'execution_attribution': engine.storage.execution_attribution(),
         'empirical_latency': engine.last_state.get('empirical_latency_model') or engine._latency_model(),
         'research_gate': _gate_payload(),
-    }
+    })
 
 
 @app.get('/api/state')
 async def state():
-    return engine.last_state
+    return _json_safe(engine.last_state)
 
 
 @app.get('/api/trades')
 async def trades(limit: int = 50):
-    return {'trades': engine.storage.recent_trades(max(1, min(limit, 500)))}
+    return _json_safe({'trades': engine.storage.recent_trades(max(1, min(limit, 500)))})
 
 
 @app.get('/api/execution')
 async def execution_metrics():
-    return {
+    return _json_safe({
         'fills': engine.storage.execution_metrics(),
         'attribution': engine.storage.execution_attribution(),
         'empirical': engine.empirical.summary(engine.orderbook_stream.horizons_ms),
         'latency_model': engine._latency_model(),
         'empirical_latency_enabled': bool(engine.last_state.get('empirical_latency_enabled')),
-    }
+    })
 
 
 @app.get('/api/execution-events')
 async def execution_events(limit: int = 100):
-    return {'events': engine.storage.recent_execution_events(max(1, min(limit, 2000)))}
+    return _json_safe({'events': engine.storage.recent_execution_events(max(1, min(limit, 2000)))})
 
 
 @app.get('/api/empirical-execution')
 async def empirical_execution():
-    return {
+    return _json_safe({
         'stream': engine.orderbook_stream.status(),
         'summary': engine.empirical.summary(engine.orderbook_stream.horizons_ms),
         'latency_model': engine.last_state.get('empirical_latency_model') or engine._latency_model(),
         'enabled_for_simulation': bool(engine.last_state.get('empirical_latency_enabled')),
-    }
+    })
 
 
 @app.get('/api/observations')
 async def observations(limit: int = 200):
-    return {'observations': engine.storage.recent_observations(max(1, min(limit, 2000)))}
+    return _json_safe({'observations': engine.storage.recent_observations(max(1, min(limit, 2000)))})
 
 
 @app.get('/api/analytics')
 async def research_analytics():
-    return analytics.summary()
+    return _json_safe(analytics.summary())
 
 
 @app.get('/api/model-lab')
 async def model_lab_status():
-    return {
+    return _json_safe({
         **engine.model_registry.status(),
         'auto_training': engine.last_state.get('auto_training') or engine._auto_train_state,
-    }
+    })
 
 
 @app.post('/api/model-lab/train')
 async def train_model_lab():
     try:
-        return await asyncio.to_thread(model_lab.train)
+        return _json_safe(await asyncio.to_thread(model_lab.train))
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f'Model lab failed: {type(exc).__name__}: {exc}') from exc
 
@@ -136,24 +154,25 @@ async def train_model_lab():
 @app.get('/api/strategy-eval')
 async def strategy_evaluation():
     report = strategy_eval.last_report()
-    return report or {
+    return _json_safe(report or {
         'status': 'not_run',
         'message': 'Run POST /api/strategy-eval/run after completed windows have been collected.',
-    }
+    })
 
 
 @app.post('/api/strategy-eval/run')
 async def run_strategy_evaluation():
     try:
         report = await asyncio.to_thread(strategy_eval.run)
-        return {**report, 'research_gate': _gate_payload(report)}
+        payload = {**report, 'research_gate': _gate_payload(report)}
+        return _json_safe(payload)
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f'Strategy evaluation failed: {type(exc).__name__}: {exc}') from exc
 
 
 @app.get('/api/research-gate')
 async def research_gate_status():
-    return _gate_payload()
+    return _json_safe(_gate_payload())
 
 
 @app.get('/api/replay/{ticker}')
@@ -161,13 +180,13 @@ async def replay(ticker: str):
     data = engine.storage.replay_window(ticker)
     if data is None:
         raise HTTPException(status_code=404, detail='No recorded observations for that ticker')
-    return data
+    return _json_safe(data)
 
 
 @app.post('/api/cycle')
 async def cycle():
     try:
-        return await engine.cycle()
+        return _json_safe(await engine.cycle())
     except Exception as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
