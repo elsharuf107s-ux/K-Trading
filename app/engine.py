@@ -99,19 +99,49 @@ class TradingEngine:
             except asyncio.TimeoutError:
                 pass
 
+    @staticmethod
+    def _resolved_market_result(raw: dict) -> tuple[str | None, str | None]:
+        """Return a definitive binary settlement result when Kalshi has one.
+
+        `result` is the primary field. For defensive reconciliation, a settled
+        market with an exact binary `settlement_value_dollars` can also be
+        labeled even if the result field is temporarily absent or delayed.
+        """
+        result = str(raw.get('result') or '').strip().lower()
+        settled_at = str(raw.get('settlement_ts') or '') or None
+        if result in ('yes', 'no'):
+            return result, settled_at
+
+        status = str(raw.get('status') or '').strip().lower()
+        if status != 'settled' and not settled_at:
+            return None, settled_at
+
+        value = raw.get('settlement_value_dollars')
+        try:
+            settlement_value = float(value)
+        except (TypeError, ValueError):
+            return None, settled_at
+        if settlement_value >= 0.9999:
+            return 'yes', settled_at
+        if settlement_value <= 0.0001:
+            return 'no', settled_at
+        return None, settled_at
+
     async def _reconcile_completed_markets(self, current_ticker: str) -> list:
         settlements = []
-        candidates = set(self.storage.unresolved_tickers(current_ticker, limit=8))
+        # Scan more than a handful of old windows so a temporary API delay does
+        # not strand labels forever when several 15-minute markets roll by.
+        candidates = set(self.storage.unresolved_tickers(current_ticker, limit=64))
         candidates.update(t for t in self.paper.positions if t != current_ticker)
         for ticker in candidates:
             try:
                 raw = await self.kalshi.get_market(ticker)
             except Exception:
                 continue
-            result = str(raw.get('result') or '').lower()
+            result, settled_at = self._resolved_market_result(raw)
             if result not in ('yes', 'no'):
                 continue
-            self.storage.save_market_result(ticker, result)
+            self.storage.save_market_result(ticker, result, settled_at=settled_at)
             if ticker in self.paper.positions:
                 trade = self.paper.settle(ticker, result)
                 self.storage.save_trade(trade)
