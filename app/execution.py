@@ -12,15 +12,7 @@ def _ceil_centicent(value: float) -> float:
 
 
 def event_contract_fee(quantity: int, price: float, maker: bool = False) -> float:
-    """Approximate Kalshi event-contract fee with current general rounding.
-
-    July 2026 general schedule:
-      raw fee = multiplier * rate * C * P * (1-P)
-      fee + positionCost is rounded up to a centicent ($0.0001).
-
-    Product-specific multipliers can differ, so all rates/multipliers live in
-    settings and should be updated when Kalshi changes the schedule.
-    """
+    """Approximate Kalshi event-contract fee with current general rounding."""
     if quantity <= 0:
         return 0.0
     p = max(0.0, min(1.0, float(price)))
@@ -48,9 +40,6 @@ class ExecutionSimulator:
 
     @staticmethod
     def _book(market: MarketSnapshot, side: str, intent: str) -> list[tuple[float, float]]:
-        # Kalshi exposes YES bids and NO bids. Buying YES consumes NO bids at
-        # complementary prices; buying NO consumes YES bids. Selling a held
-        # side consumes that same side's bids directly.
         if intent == 'buy' and side == 'yes':
             levels = [(1.0 - p, q) for p, q in market.no_book]
             return sorted(levels, key=lambda x: x[0])
@@ -97,7 +86,8 @@ class ExecutionSimulator:
 
         top_price = float(book[0][0])
         remaining = requested
-        notional = 0.0
+        raw_notional = 0.0
+        adjusted_notional = 0.0
         fees = 0.0
         fills = 0
         penalty = self._latency_penalty(wave_score)
@@ -111,10 +101,8 @@ class ExecutionSimulator:
             take = min(remaining, available)
             adjusted = raw_price + penalty if intent == 'buy' else raw_price - penalty
             adjusted = max(0.01, min(0.99, adjusted))
-            notional += take * adjusted
-            # A marketable order can match multiple resting price levels. Fee
-            # rounding is modeled per matched level instead of pretending all
-            # contracts traded at one average price.
+            raw_notional += take * raw_price
+            adjusted_notional += take * adjusted
             fees += event_contract_fee(take, adjusted, maker=False)
             remaining -= take
             fills += 1
@@ -132,14 +120,21 @@ class ExecutionSimulator:
                 reason='Visible depth was below one whole contract',
             )
 
-        average = notional / filled
-        # Positive slippage means worse execution than the displayed top quote.
-        slippage = average - top_price if intent == 'buy' else top_price - average
+        raw_average = raw_notional / filled
+        average = adjusted_notional / filled
+        if intent == 'buy':
+            depth_slippage = max(0.0, raw_average - top_price)
+            latency_slippage = max(0.0, average - raw_average)
+            total_slippage = max(0.0, average - top_price)
+        else:
+            depth_slippage = max(0.0, top_price - raw_average)
+            latency_slippage = max(0.0, raw_average - average)
+            total_slippage = max(0.0, top_price - average)
+
         complete = filled == requested
         fill_fraction = filled / requested
-
         reason = 'Complete taker fill' if complete else f'Partial taker fill ({filled}/{requested})'
-        if slippage > settings.sim_max_execution_slippage:
+        if total_slippage > settings.sim_max_execution_slippage:
             reason += '; execution slippage exceeds configured limit'
         if fill_fraction < settings.sim_min_fill_fraction:
             reason += '; fill fraction below configured minimum'
@@ -153,7 +148,9 @@ class ExecutionSimulator:
             average_price=average,
             top_price=top_price,
             fee=fees,
-            slippage=max(0.0, slippage),
+            slippage=total_slippage,
+            depth_slippage=depth_slippage,
+            latency_slippage=latency_slippage,
             latency_ms=settings.sim_latency_ms,
             levels_consumed=fills,
             complete=complete,
