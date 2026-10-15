@@ -50,7 +50,7 @@ def _extract_target(m: dict[str, Any]) -> float | None:
 class KalshiPublicClient:
     def __init__(self, base_url: str | None = None):
         self.base_url = (base_url or settings.kalshi_base_url).rstrip('/')
-        self._client = httpx.AsyncClient(timeout=10.0, headers={'User-Agent': 'K-Trading/0.2'})
+        self._client = httpx.AsyncClient(timeout=10.0, headers={'User-Agent': 'K-Trading/0.5'})
 
     async def close(self) -> None:
         await self._client.aclose()
@@ -111,34 +111,53 @@ class KalshiPublicClient:
         return self.normalize(candidates[0][1])
 
     async def enrich_orderbook(self, market: MarketSnapshot, depth_levels: int = 5) -> MarketSnapshot:
+        requested_depth = max(depth_levels, settings.execution_book_depth, 10)
         try:
-            book = await self.get_orderbook(market.ticker, depth=max(depth_levels, 10))
+            book = await self.get_orderbook(market.ticker, depth=requested_depth)
         except Exception:
             return market
+
         def levels(name: str) -> list[tuple[float, float]]:
+            raw_levels = book.get(name, []) or []
+            # A few older response wrappers used {bids:[...]}; tolerate both.
+            if isinstance(raw_levels, dict):
+                raw_levels = raw_levels.get('bids', []) or []
             out: list[tuple[float, float]] = []
-            for row in book.get(name, []) or []:
+            for row in raw_levels:
                 if not isinstance(row, (list, tuple)) or len(row) < 2:
                     continue
-                price = _to_float(row[0]); qty = _to_float(row[1])
+                price = _to_float(row[0])
+                qty = _to_float(row[1])
+                # Legacy integer-cent responses use 1..99 instead of dollars.
+                if price > 1:
+                    price /= 100.0
                 if 0 <= price <= 1 and qty > 0:
                     out.append((price, qty))
+            # Current API dollar arrays are ascending; sort defensively.
             out.sort(key=lambda x: x[0])
             return out
+
         yes = levels('yes_dollars') or levels('yes')
         no = levels('no_dollars') or levels('no')
         yes_bid = yes[-1][0] if yes else market.yes_bid
         no_bid = no[-1][0] if no else market.no_bid
         yes_ask = 1.0 - no_bid if no else market.yes_ask
         no_ask = 1.0 - yes_bid if yes else market.no_ask
-        yes_depth = sum(q for _, q in yes[-depth_levels:]); no_depth = sum(q for _, q in no[-depth_levels:])
+        yes_depth = sum(q for _, q in yes[-depth_levels:])
+        no_depth = sum(q for _, q in no[-depth_levels:])
         total = yes_depth + no_depth
         imbalance = (yes_depth - no_depth) / total if total > 0 else 0.0
         return market.model_copy(update={
-            'yes_bid': max(0.0, min(1.0, yes_bid)), 'yes_ask': max(0.0, min(1.0, yes_ask)),
-            'no_bid': max(0.0, min(1.0, no_bid)), 'no_ask': max(0.0, min(1.0, no_ask)),
-            'yes_depth': yes_depth, 'no_depth': no_depth,
-            'book_imbalance': max(-1.0, min(1.0, imbalance)), 'captured_at': datetime.now(timezone.utc),
+            'yes_bid': max(0.0, min(1.0, yes_bid)),
+            'yes_ask': max(0.0, min(1.0, yes_ask)),
+            'no_bid': max(0.0, min(1.0, no_bid)),
+            'no_ask': max(0.0, min(1.0, no_ask)),
+            'yes_depth': yes_depth,
+            'no_depth': no_depth,
+            'book_imbalance': max(-1.0, min(1.0, imbalance)),
+            'yes_book': yes,
+            'no_book': no,
+            'captured_at': datetime.now(timezone.utc),
         })
 
     def normalize(self, m: dict[str, Any]) -> MarketSnapshot:
@@ -152,11 +171,21 @@ class KalshiPublicClient:
         no_ask = _price(m, 'no_ask_dollars', 'no_ask', min(1.0, 1 - yes_bid))
         last = _price(m, 'last_price_dollars', 'last_price', (yes_bid + yes_ask) / 2 if yes_ask < 1 else 0.5)
         return MarketSnapshot(
-            ticker=str(m.get('ticker') or ''), event_ticker=str(m.get('event_ticker') or ''),
-            title=str(m.get('title') or ''), subtitle=str(m.get('subtitle') or ''), open_time=open_time,
-            close_time=close_time, yes_bid=yes_bid, yes_ask=yes_ask, no_bid=no_bid, no_ask=no_ask,
-            last_price=last, volume=_to_float(m.get('volume_fp', m.get('volume', 0))),
+            ticker=str(m.get('ticker') or ''),
+            event_ticker=str(m.get('event_ticker') or ''),
+            title=str(m.get('title') or ''),
+            subtitle=str(m.get('subtitle') or ''),
+            open_time=open_time,
+            close_time=close_time,
+            yes_bid=yes_bid,
+            yes_ask=yes_ask,
+            no_bid=no_bid,
+            no_ask=no_ask,
+            last_price=last,
+            volume=_to_float(m.get('volume_fp', m.get('volume', 0))),
             open_interest=_to_float(m.get('open_interest_fp', m.get('open_interest', 0))),
-            seconds_remaining=seconds_remaining, raw_target=_extract_target(m),
-            rules_primary=str(m.get('rules_primary') or ''), captured_at=now,
+            seconds_remaining=seconds_remaining,
+            raw_target=_extract_target(m),
+            rules_primary=str(m.get('rules_primary') or ''),
+            captured_at=now,
         )
