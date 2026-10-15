@@ -29,6 +29,11 @@ class MarketSnapshot(BaseModel):
     yes_depth: float = 0.0
     no_depth: float = 0.0
     book_imbalance: float = 0.0
+    # Kalshi publishes YES bids and NO bids. We preserve them so the paper
+    # executor can derive asks and walk real visible depth instead of filling
+    # the whole order at the top quote.
+    yes_book: list[tuple[float, float]] = Field(default_factory=list)
+    no_book: list[tuple[float, float]] = Field(default_factory=list)
     captured_at: datetime = Field(default_factory=utc_now)
 
     @property
@@ -111,11 +116,28 @@ class Decision(BaseModel):
     risk_status: str = 'not_checked'
 
 
+class ExecutionFill(BaseModel):
+    ticker: str
+    side: Literal['yes', 'no']
+    intent: Literal['buy', 'sell']
+    requested_quantity: int
+    filled_quantity: int
+    average_price: float = 0.0
+    top_price: float = 0.0
+    fee: float = 0.0
+    slippage: float = 0.0
+    latency_ms: float = 0.0
+    levels_consumed: int = 0
+    complete: bool = False
+    reason: str = ''
+
+
 class PaperPosition(BaseModel):
     ticker: str
     side: Literal['yes', 'no']
     quantity: int
     entry_price: float
+    entry_fee: float = 0.0
     opened_at: datetime = Field(default_factory=utc_now)
     peak_mark: float = 0.0
 
@@ -127,5 +149,8 @@ class TradeRecord(BaseModel):
     quantity: int
     price: float
     pnl: float = 0.0
+    fee: float = 0.0
+    requested_quantity: int | None = None
+    slippage: float = 0.0
     reason: str = ''
     created_at: datetime = Field(default_factory=utc_now)
