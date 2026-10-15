@@ -13,10 +13,12 @@ from pydantic import BaseModel
 
 from .analytics import ResearchAnalytics
 from .engine import TradingEngine
+from .fast_path import FastPathController
 from .model_lab import ModelLab
 from .strategy_eval import ResearchGate, StrategyEvaluator
 
 engine = TradingEngine()
+fast_path = FastPathController(engine)
 analytics = ResearchAnalytics(engine.storage)
 model_lab = ModelLab(engine.storage, engine.model_registry)
 strategy_eval = StrategyEvaluator(engine.storage)
@@ -26,11 +28,13 @@ research_gate = ResearchGate(engine.storage, strategy_eval)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await engine.start()
+    await fast_path.start()
     yield
+    await fast_path.stop()
     await engine.stop()
 
 
-app = FastAPI(title='K-Trading', version='0.8.1', lifespan=lifespan)
+app = FastAPI(title='K-Trading', version='0.9.0', lifespan=lifespan)
 
 WEB_DIR = Path(__file__).resolve().parent.parent / 'web'
 if WEB_DIR.exists():
@@ -47,12 +51,7 @@ async def dashboard():
 
 
 def _json_safe(value: Any) -> Any:
-    """Recursively remove values that strict JSON encoders cannot serialize.
-
-    Starlette/FastAPI intentionally reject NaN and +/-Infinity. Research metrics
-    can occasionally produce one of those values on tiny/degenerate samples,
-    so convert them to null instead of letting the response terminate mid-body.
-    """
+    """Recursively remove values that strict JSON encoders cannot serialize."""
     if isinstance(value, float):
         return value if math.isfinite(value) else None
     if isinstance(value, dict):
@@ -79,6 +78,8 @@ async def health():
         'version': app.version,
         'benchmark_stream': engine.benchmark_stream.status(),
         'orderbook_stream': engine.orderbook_stream.status(),
+        'fast_path': fast_path.status(),
+        'ai_sidecar': fast_path.sidecar.status(),
         'data_health': engine.last_state.get('data_health'),
         'model_registry': engine.model_registry.status(),
         'auto_training': engine.last_state.get('auto_training'),
@@ -91,7 +92,20 @@ async def health():
 
 @app.get('/api/state')
 async def state():
-    return _json_safe(engine.last_state)
+    state = dict(engine.last_state)
+    state['fast_path'] = fast_path.status()
+    state['ai_sidecar'] = fast_path.sidecar.status()
+    return _json_safe(state)
+
+
+@app.get('/api/fast-path')
+async def fast_path_status():
+    return _json_safe(fast_path.status())
+
+
+@app.get('/api/ai-sidecar')
+async def ai_sidecar_status():
+    return _json_safe(fast_path.sidecar.status())
 
 
 @app.get('/api/trades')
