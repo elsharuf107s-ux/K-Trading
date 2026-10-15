@@ -10,7 +10,7 @@ from .features import MarketBuffer, PriceBuffer, ReferenceBuffer, build_features
 from .forecast import BaselineForecaster
 from .kalshi import KalshiPublicClient
 from .model_lab import AdaptiveForecaster, ModelRegistry
-from .models import Decision, ExecutionFill
+from .models import Decision, ExecutionEvent, ExecutionFill
 from .paper import PaperBroker
 from .risk import AccountRiskState, RiskEngine
 from .storage import Storage
@@ -98,19 +98,48 @@ class TradingEngine:
                 settlements.append(trade)
         return settlements
 
-    def _entry_fill(self, market, decision: Decision, forecast) -> tuple[Decision, ExecutionFill | None]:
+    def _data_health(self, market, btc, benchmark, features) -> dict:
+        now = datetime.now(timezone.utc)
+        market_age = max(0.0, (now - market.captured_at).total_seconds())
+        benchmark_age = None
+        if benchmark is not None:
+            benchmark_age = max(0.0, (now - benchmark.captured_at).total_seconds())
+        book_ok = bool(market.yes_book and market.no_book)
+        source_count = len(btc.sources)
+        issues: list[str] = []
+        blocking: list[str] = []
+
+        if market_age > settings.max_market_snapshot_age_seconds:
+            blocking.append(f'market snapshot age {market_age:.1f}s')
+        if settings.require_orderbook_for_entry and not book_ok:
+            blocking.append('missing executable YES/NO book depth')
+        if features.source_dispersion > settings.max_source_dispersion:
+            blocking.append(f'spot-source dispersion {features.source_dispersion:.2%}')
+        if benchmark is None:
+            issues.append('BRTI unavailable; proxy reference mode')
+        elif benchmark_age is not None and benchmark_age > settings.benchmark_stale_seconds:
+            issues.append(f'BRTI age {benchmark_age:.1f}s')
+        if source_count < 2:
+            issues.append('only one public BTC spot source available')
+
+        status = 'blocked' if blocking else 'degraded' if issues else 'healthy'
+        return {
+            'status': status,
+            'blocking': blocking,
+            'issues': issues,
+            'market_age_seconds': market_age,
+            'benchmark_age_seconds': benchmark_age,
+            'book_ok': book_ok,
+            'spot_source_count': source_count,
+            'source_dispersion': features.source_dispersion,
+        }
+
+    def _entry_fill(self, market, decision: Decision, forecast, wave_score: float) -> tuple[Decision, ExecutionFill | None]:
         requested = decision.quantity
         fill: ExecutionFill | None = None
-
-        # Fees can push a max-cash order above available cash. Re-simulate with
-        # one fewer contract until the complete/partial fill actually fits.
         while requested > 0:
             candidate = self.execution.simulate(
-                market,
-                decision.side,
-                'buy',
-                requested,
-                wave_score=market.book_imbalance if market.book_imbalance else 0.0,
+                market, decision.side, 'buy', requested, wave_score=wave_score,
             )
             if candidate.filled_quantity < 1:
                 return Decision(
@@ -162,14 +191,59 @@ class TradingEngine:
             'reason': f'{decision.reason}; executable edge {realized_entry_edge:.1%}',
         }), fill
 
-    def _exit_fill(self, market, decision: Decision, quantity: int) -> ExecutionFill:
-        return self.execution.simulate(
-            market,
-            decision.side,
-            'sell',
-            quantity,
-            wave_score=market.book_imbalance if market.book_imbalance else 0.0,
+    def _exit_fill(self, market, decision: Decision, quantity: int, wave_score: float) -> ExecutionFill:
+        return self.execution.simulate(market, decision.side, 'sell', quantity, wave_score=wave_score)
+
+    def _record_execution_event(
+        self,
+        fill: ExecutionFill,
+        requested_decision: Decision,
+        final_decision: Decision,
+        forecast,
+    ) -> ExecutionEvent:
+        fair = forecast.yes_probability if fill.side == 'yes' else 1.0 - forecast.yes_probability
+        if fill.intent == 'buy':
+            gross_before = fair - (fill.top_price or requested_decision.price)
+            executable_after = (
+                fair - fill.average_price - fill.fee / max(fill.filled_quantity, 1) - settings.uncertainty_buffer
+                if fill.filled_quantity > 0 else 0.0
+            )
+        else:
+            gross_before = (fill.top_price or requested_decision.price) - fair
+            executable_after = (
+                fill.average_price - fair - fill.fee / max(fill.filled_quantity, 1)
+                if fill.filled_quantity > 0 else 0.0
+            )
+
+        if fill.filled_quantity < 1:
+            status = 'no_liquidity'
+        elif final_decision.action == 'HOLD':
+            status = 'rejected'
+        elif fill.complete:
+            status = 'filled'
+        else:
+            status = 'partial'
+
+        event = ExecutionEvent(
+            ticker=fill.ticker,
+            side=fill.side,
+            intent=fill.intent,
+            status=status,
+            requested_quantity=fill.requested_quantity,
+            filled_quantity=fill.filled_quantity,
+            fair_probability=fair,
+            top_price=fill.top_price,
+            average_price=fill.average_price,
+            gross_edge_before=gross_before,
+            executable_edge_after=executable_after,
+            fee=fill.fee,
+            depth_slippage=fill.depth_slippage,
+            latency_slippage=fill.latency_slippage,
+            total_slippage=fill.slippage,
+            reason=final_decision.reason,
         )
+        self.storage.save_execution_event(event)
+        return event
 
     async def cycle(self) -> dict:
         market = await self.kalshi.discover_btc_15m()
@@ -195,15 +269,11 @@ class TradingEngine:
             self.reference_buffer.add_benchmark(benchmark)
 
         features = build_features(
-            market,
-            btc,
-            self.buffer,
-            self.market_buffer,
-            benchmark,
-            self.reference_buffer,
+            market, btc, self.buffer, self.market_buffer, benchmark, self.reference_buffer,
         )
         forecast = self.forecaster.predict(features)
         self.storage.save_observation(market, features, forecast)
+        data_health = self._data_health(market, btc, benchmark, features)
 
         marks = {}
         pos = self.paper.positions.get(market.ticker)
@@ -220,13 +290,12 @@ class TradingEngine:
 
         trade = None
         fill = None
+        execution_event = None
         if pos:
             decision = self.risk.evaluate_exit(features, forecast, pos)
+            requested_decision = decision
             if settings.auto_paper_trade and decision.action == 'EXIT':
-                fill = self._exit_fill(market, decision, pos.quantity)
-                # On an exit signal we reduce whatever visible quantity can be
-                # filled. We do not block a risk exit just because slippage is
-                # ugly; partial de-risking is more realistic than a magic fill.
+                fill = self._exit_fill(market, decision, pos.quantity, features.wave_score)
                 if fill.filled_quantity > 0:
                     trade = self.paper.close_fill(fill, decision.reason)
                     self.storage.save_trade(trade)
@@ -235,10 +304,20 @@ class TradingEngine:
                         'reason': f'{decision.reason}; no visible exit liquidity',
                         'risk_status': 'blocked',
                     })
+                execution_event = self._record_execution_event(fill, requested_decision, decision, forecast)
         else:
-            decision = self.risk.evaluate_entry(features, forecast, account)
+            if data_health['status'] == 'blocked':
+                decision = Decision(
+                    action='HOLD',
+                    reason='Data-health gate: ' + '; '.join(data_health['blocking']),
+                    risk_status='blocked',
+                )
+            else:
+                decision = self.risk.evaluate_entry(features, forecast, account)
+            requested_decision = decision
             if settings.auto_paper_trade and decision.action in ('BUY_YES', 'BUY_NO') and decision.quantity > 0:
-                decision, fill = self._entry_fill(market, decision, forecast)
+                decision, fill = self._entry_fill(market, decision, forecast, features.wave_score)
+                execution_event = self._record_execution_event(fill, requested_decision, decision, forecast) if fill else None
                 if decision.action in ('BUY_YES', 'BUY_NO') and fill and fill.filled_quantity > 0:
                     trade = self.paper.open_fill(fill, decision.reason)
                     self.storage.save_trade(trade)
@@ -258,11 +337,14 @@ class TradingEngine:
             'btc': btc.model_dump(mode='json'),
             'benchmark': benchmark.model_dump(mode='json') if benchmark else None,
             'feed': self.benchmark_stream.status(),
+            'data_health': data_health,
             'features': features.model_dump(mode='json'),
             'forecast': forecast.model_dump(mode='json'),
             'decision': decision.model_dump(mode='json'),
             'execution_fill': fill.model_dump(mode='json') if fill else None,
+            'execution_event': execution_event.model_dump(mode='json') if execution_event else None,
             'execution_metrics': self.storage.execution_metrics(),
+            'execution_attribution': self.storage.execution_attribution(),
             'trade': trade.model_dump(mode='json') if trade else None,
             'settlements': [x.model_dump(mode='json') for x in settlements],
             'model_registry': self.model_registry.status(),
@@ -278,9 +360,9 @@ class TradingEngine:
             },
             'live_trading_enabled': settings.live_trading_enabled,
             'warning': (
-                'Using authenticated CF Benchmarks BRTI reference and BRTI momentum. Paper fills include depth, fees and latency.'
+                'Using authenticated CF Benchmarks BRTI. Paper fills include depth, current fee settings and latency attribution.'
                 if benchmark
-                else 'No fresh BRTI stream: using Coinbase/Kraken proxy. Final-minute entries are blocked. Paper fills include depth, fees and latency.'
+                else 'No fresh BRTI stream: proxy mode. Final-minute entries are blocked. Paper fills include depth, current fee settings and latency attribution.'
             ),
             'error': None,
         }
