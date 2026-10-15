@@ -66,8 +66,7 @@ class Settings(BaseSettings):
     max_source_dispersion: float = 0.003
     max_market_snapshot_age_seconds: float = 5.0
 
-    # V0.7 empirical execution learning. Sub-second measurements come from the
-    # authenticated orderbook_delta stream rather than aggressive REST polling.
+    # V0.7 empirical execution learning.
     orderbook_stream_stale_seconds: float = 2.0
     empirical_quote_horizons_ms: str = '100,250,500,1000'
     empirical_latency_min_samples: int = 200
@@ -75,12 +74,27 @@ class Settings(BaseSettings):
     auto_model_train: bool = True
     auto_train_every_windows: int = 16
 
+    # V0.8 chronological strategy replay / soak gates. These are development
+    # gates for earning the right to do more paper research, not approval for
+    # live-money trading.
+    strategy_eval_report_path: str = 'data/strategy_eval.json'
+    strategy_eval_max_report_trades: int = 500
+    soak_min_completed_windows: int = 200
+    soak_min_replay_trades: int = 50
+    soak_min_brier_gain: float = 0.0
+    soak_require_positive_replay_pnl: bool = True
+    soak_max_replay_drawdown_fraction: float = 0.10
+    soak_max_consecutive_losses: int = 10
+    soak_min_execution_fill_rate: float = 0.50
+    soak_min_empirical_samples: int = 500
+
     coinbase_spot_url: str = 'https://api.coinbase.com/v2/prices/BTC-USD/spot'
     kraken_ticker_url: str = 'https://api.kraken.com/0/public/Ticker?pair=XBTUSD'
 
     def ensure_dirs(self) -> None:
         Path(self.database_path).parent.mkdir(parents=True, exist_ok=True)
         Path(self.model_dir).mkdir(parents=True, exist_ok=True)
+        Path(self.strategy_eval_report_path).parent.mkdir(parents=True, exist_ok=True)
 
     @property
     def has_kalshi_credentials(self) -> bool:
