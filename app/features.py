@@ -20,10 +20,19 @@ class PriceBuffer:
         if price <= 0:
             return
         ts = captured_at.timestamp()
+        # Do not duplicate identical timestamp/value frames when the fast path
+        # observes the same slow-loop sample several times.
+        if self.points and abs(self.points[-1][0] - ts) < 1e-9 and self.points[-1][1] == price:
+            return
         self.points.append((ts, price))
         cutoff = ts - self.max_seconds
         while self.points and self.points[0][0] < cutoff:
             self.points.popleft()
+
+    def recent_points(self, limit: int = 256) -> list[tuple[float, float]]:
+        if limit <= 0:
+            return []
+        return list(self.points)[-limit:]
 
     def _price_at_or_before(self, seconds_ago: int) -> float | None:
         if not self.points:
@@ -71,10 +80,18 @@ class MarketBuffer:
             self.ticker = market.ticker
             self.points.clear()
         ts = market.captured_at.timestamp()
-        self.points.append((ts, market.yes_mid, market.book_imbalance))
+        point = (ts, market.yes_mid, market.book_imbalance)
+        if self.points and self.points[-1] == point:
+            return
+        self.points.append(point)
         cutoff = ts - self.max_seconds
         while self.points and self.points[0][0] < cutoff:
             self.points.popleft()
+
+    def recent_points(self, limit: int = 256) -> list[tuple[float, float, float]]:
+        if limit <= 0:
+            return []
+        return list(self.points)[-limit:]
 
     def momentum(self, seconds: int) -> float:
         if not self.points:
