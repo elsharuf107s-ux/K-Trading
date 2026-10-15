@@ -1,0 +1,7 @@
+# Optional AI sidecar only. The core K-Trading process does not require these.
+fastapi==0.116.1
+uvicorn[standard]==0.35.0
+pydantic==2.11.7
+chronos-forecasting==2.3.2
+pandas>=2.2,<4
+numpy>=2.0,<3
