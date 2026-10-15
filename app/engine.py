@@ -5,12 +5,14 @@ from datetime import datetime, timezone
 
 from .btc import BtcPriceClient
 from .config import settings
+from .empirical import EmpiricalExecutionLab
 from .execution import ExecutionSimulator
 from .features import MarketBuffer, PriceBuffer, ReferenceBuffer, build_features
 from .forecast import BaselineForecaster
 from .kalshi import KalshiPublicClient
-from .model_lab import AdaptiveForecaster, ModelRegistry
+from .model_lab import AdaptiveForecaster, ModelLab, ModelRegistry
 from .models import Decision, ExecutionEvent, ExecutionFill
+from .orderbook_stream import OrderBookStream
 from .paper import PaperBroker
 from .risk import AccountRiskState, RiskEngine
 from .storage import Storage
@@ -26,20 +28,35 @@ class TradingEngine:
         self.reference_buffer = ReferenceBuffer()
         self.market_buffer = MarketBuffer()
         self.benchmark_stream = CFBenchmarkStream()
+        self.orderbook_stream = OrderBookStream()
         self.model_registry = ModelRegistry()
+        self.storage = Storage(settings.database_path)
+        self.empirical = EmpiricalExecutionLab(settings.database_path)
+        self.model_lab = ModelLab(self.storage, self.model_registry)
         self.forecaster = AdaptiveForecaster(BaselineForecaster(), self.model_registry)
         self.risk = RiskEngine()
         self.execution = ExecutionSimulator()
-        self.storage = Storage(settings.database_path)
         self.paper = PaperBroker(settings.paper_starting_cash)
         self.paper.restore(self.storage.load_paper_state())
+
+        registry_state = self.model_registry.status()
+        last_training = registry_state.get('last_training') or {}
+        self._last_auto_train_windows = int(last_training.get('windows') or 0)
+        self._auto_train_task: asyncio.Task | None = None
+        self._auto_train_state: dict = {
+            'enabled': settings.auto_model_train,
+            'status': 'idle',
+            'last_trigger_windows': self._last_auto_train_windows,
+        }
+
         self.last_state: dict = {
             'status': 'starting',
             'mode': 'paper',
             'live_trading_enabled': settings.live_trading_enabled,
-            'model_registry': self.model_registry.status(),
+            'model_registry': registry_state,
             'execution': {'mode': 'depth_aware_taker_sim'},
-            'warning': 'Paper-only. Authenticated BRTI streaming activates when Kalshi API credentials are configured.',
+            'auto_training': self._auto_train_state,
+            'warning': 'Paper-only. Authenticated BRTI/orderbook streaming activates when Kalshi API credentials are configured.',
         }
         self._stop = asyncio.Event()
         self._task: asyncio.Task | None = None
@@ -49,6 +66,7 @@ class TradingEngine:
 
     async def start(self) -> None:
         await self.benchmark_stream.start()
+        await self.orderbook_stream.start()
         if self._task is None:
             self._task = asyncio.create_task(self._loop(), name='trading-engine')
 
@@ -57,7 +75,10 @@ class TradingEngine:
         if self._task:
             await self._task
         self._persist_paper()
+        await self.orderbook_stream.stop()
         await self.benchmark_stream.stop()
+        if self._auto_train_task and not self._auto_train_task.done():
+            await self._auto_train_task
         await self.kalshi.close()
         await self.btc.close()
 
@@ -98,6 +119,62 @@ class TradingEngine:
                 settlements.append(trade)
         return settlements
 
+    def _maybe_schedule_auto_training(self) -> None:
+        if not settings.auto_model_train:
+            return
+        if self._auto_train_task and not self._auto_train_task.done():
+            return
+        windows = len(self.storage.last_labeled_observations(limit=100_000))
+        if windows < settings.model_min_windows:
+            self._auto_train_state = {
+                'enabled': True,
+                'status': 'waiting_for_windows',
+                'completed_windows': windows,
+                'next_trigger_windows': settings.model_min_windows,
+            }
+            return
+        required_delta = max(1, int(settings.auto_train_every_windows))
+        if windows - self._last_auto_train_windows < required_delta and self._last_auto_train_windows > 0:
+            self._auto_train_state = {
+                'enabled': True,
+                'status': 'waiting_for_new_windows',
+                'completed_windows': windows,
+                'last_trigger_windows': self._last_auto_train_windows,
+                'next_trigger_windows': self._last_auto_train_windows + required_delta,
+            }
+            return
+
+        self._last_auto_train_windows = windows
+        self._auto_train_state = {
+            'enabled': True,
+            'status': 'training',
+            'completed_windows': windows,
+            'last_trigger_windows': windows,
+        }
+
+        async def runner() -> None:
+            try:
+                report = await asyncio.to_thread(self.model_lab.train)
+                self._auto_train_state = {
+                    'enabled': True,
+                    'status': report.get('status', 'completed'),
+                    'completed_windows': windows,
+                    'last_trigger_windows': windows,
+                    'promoted': bool(report.get('promoted')),
+                    'selected_model': (report.get('selected') or {}).get('name'),
+                    'reason': report.get('reason'),
+                }
+            except Exception as exc:
+                self._auto_train_state = {
+                    'enabled': True,
+                    'status': 'error',
+                    'completed_windows': windows,
+                    'last_trigger_windows': windows,
+                    'error': f'{type(exc).__name__}: {exc}',
+                }
+
+        self._auto_train_task = asyncio.create_task(runner(), name='auto-model-train')
+
     def _data_health(self, market, btc, benchmark, features) -> dict:
         now = datetime.now(timezone.utc)
         market_age = max(0.0, (now - market.captured_at).total_seconds())
@@ -106,6 +183,8 @@ class TradingEngine:
             benchmark_age = max(0.0, (now - benchmark.captured_at).total_seconds())
         book_ok = bool(market.yes_book and market.no_book)
         source_count = len(btc.sources)
+        stream_status = self.orderbook_stream.status()
+        stream_live = self.orderbook_stream.fresh(market.ticker)
         issues: list[str] = []
         blocking: list[str] = []
 
@@ -121,6 +200,10 @@ class TradingEngine:
             issues.append(f'BRTI age {benchmark_age:.1f}s')
         if source_count < 2:
             issues.append('only one public BTC spot source available')
+        if self.orderbook_stream.enabled and not stream_live:
+            issues.append('streaming orderbook unavailable; REST depth fallback')
+        if stream_status.get('sequence_gaps', 0):
+            issues.append(f"orderbook sequence gaps seen: {stream_status['sequence_gaps']}")
 
         status = 'blocked' if blocking else 'degraded' if issues else 'healthy'
         return {
@@ -130,16 +213,41 @@ class TradingEngine:
             'market_age_seconds': market_age,
             'benchmark_age_seconds': benchmark_age,
             'book_ok': book_ok,
+            'book_source': 'websocket' if stream_live else 'rest',
             'spot_source_count': source_count,
             'source_dispersion': features.source_dispersion,
+            'orderbook_sequence_gaps': stream_status.get('sequence_gaps', 0),
         }
 
-    def _entry_fill(self, market, decision: Decision, forecast, wave_score: float) -> tuple[Decision, ExecutionFill | None]:
+    def _latency_model(self) -> dict:
+        return self.empirical.recommended_adverse_slippage(
+            settings.sim_latency_ms,
+            min_samples=settings.empirical_latency_min_samples,
+        )
+
+    def _latency_override(self, latency_model: dict) -> float | None:
+        if not settings.use_empirical_latency or not latency_model.get('ready'):
+            return None
+        return float(latency_model.get('p95_adverse_move') or 0.0)
+
+    def _entry_fill(
+        self,
+        market,
+        decision: Decision,
+        forecast,
+        wave_score: float,
+        latency_override: float | None,
+    ) -> tuple[Decision, ExecutionFill | None]:
         requested = decision.quantity
         fill: ExecutionFill | None = None
         while requested > 0:
             candidate = self.execution.simulate(
-                market, decision.side, 'buy', requested, wave_score=wave_score,
+                market,
+                decision.side,
+                'buy',
+                requested,
+                wave_score=wave_score,
+                latency_penalty_override=latency_override,
             )
             if candidate.filled_quantity < 1:
                 return Decision(
@@ -191,8 +299,22 @@ class TradingEngine:
             'reason': f'{decision.reason}; executable edge {realized_entry_edge:.1%}',
         }), fill
 
-    def _exit_fill(self, market, decision: Decision, quantity: int, wave_score: float) -> ExecutionFill:
-        return self.execution.simulate(market, decision.side, 'sell', quantity, wave_score=wave_score)
+    def _exit_fill(
+        self,
+        market,
+        decision: Decision,
+        quantity: int,
+        wave_score: float,
+        latency_override: float | None,
+    ) -> ExecutionFill:
+        return self.execution.simulate(
+            market,
+            decision.side,
+            'sell',
+            quantity,
+            wave_score=wave_score,
+            latency_penalty_override=latency_override,
+        )
 
     def _record_execution_event(
         self,
@@ -253,13 +375,20 @@ class TradingEngine:
                 'status': 'waiting_for_market',
                 'updated_at': datetime.now(timezone.utc).isoformat(),
                 'feed': self.benchmark_stream.status(),
+                'orderbook_stream': self.orderbook_stream.status(),
                 'model_registry': self.model_registry.status(),
                 'error': None,
             }
             return self.last_state
 
+        self.orderbook_stream.set_ticker(market.ticker)
         market = await self.kalshi.enrich_orderbook(market)
+        if self.orderbook_stream.fresh(market.ticker):
+            market = self.orderbook_stream.apply_to_market(market)
+        saved_quote_moves = self.empirical.save_moves(self.orderbook_stream.drain_moves())
+
         settlements = await self._reconcile_completed_markets(market.ticker)
+        self._maybe_schedule_auto_training()
 
         btc = await self.btc.get()
         self.buffer.add(btc)
@@ -274,6 +403,8 @@ class TradingEngine:
         forecast = self.forecaster.predict(features)
         self.storage.save_observation(market, features, forecast)
         data_health = self._data_health(market, btc, benchmark, features)
+        latency_model = self._latency_model()
+        latency_override = self._latency_override(latency_model)
 
         marks = {}
         pos = self.paper.positions.get(market.ticker)
@@ -295,7 +426,9 @@ class TradingEngine:
             decision = self.risk.evaluate_exit(features, forecast, pos)
             requested_decision = decision
             if settings.auto_paper_trade and decision.action == 'EXIT':
-                fill = self._exit_fill(market, decision, pos.quantity, features.wave_score)
+                fill = self._exit_fill(
+                    market, decision, pos.quantity, features.wave_score, latency_override,
+                )
                 if fill.filled_quantity > 0:
                     trade = self.paper.close_fill(fill, decision.reason)
                     self.storage.save_trade(trade)
@@ -316,7 +449,9 @@ class TradingEngine:
                 decision = self.risk.evaluate_entry(features, forecast, account)
             requested_decision = decision
             if settings.auto_paper_trade and decision.action in ('BUY_YES', 'BUY_NO') and decision.quantity > 0:
-                decision, fill = self._entry_fill(market, decision, forecast, features.wave_score)
+                decision, fill = self._entry_fill(
+                    market, decision, forecast, features.wave_score, latency_override,
+                )
                 execution_event = self._record_execution_event(fill, requested_decision, decision, forecast) if fill else None
                 if decision.action in ('BUY_YES', 'BUY_NO') and fill and fill.filled_quantity > 0:
                     trade = self.paper.open_fill(fill, decision.reason)
@@ -329,6 +464,7 @@ class TradingEngine:
         equity_after = self.paper.mark_equity(marks_after)
         self._persist_paper()
 
+        empirical_summary = self.empirical.summary(self.orderbook_stream.horizons_ms)
         self.last_state = {
             'status': 'running',
             'mode': 'paper',
@@ -337,6 +473,12 @@ class TradingEngine:
             'btc': btc.model_dump(mode='json'),
             'benchmark': benchmark.model_dump(mode='json') if benchmark else None,
             'feed': self.benchmark_stream.status(),
+            'orderbook_stream': self.orderbook_stream.status(),
+            'saved_quote_moves_this_cycle': saved_quote_moves,
+            'empirical_execution': empirical_summary,
+            'empirical_latency_model': latency_model,
+            'empirical_latency_enabled': bool(settings.use_empirical_latency and latency_model.get('ready')),
+            'auto_training': self._auto_train_state,
             'data_health': data_health,
             'features': features.model_dump(mode='json'),
             'forecast': forecast.model_dump(mode='json'),
@@ -360,9 +502,9 @@ class TradingEngine:
             },
             'live_trading_enabled': settings.live_trading_enabled,
             'warning': (
-                'Using authenticated CF Benchmarks BRTI. Paper fills include depth, current fee settings and latency attribution.'
+                'Using authenticated BRTI and streaming orderbook when fresh. Empirical latency can activate only after its sample gate.'
                 if benchmark
-                else 'No fresh BRTI stream: proxy mode. Final-minute entries are blocked. Paper fills include depth, current fee settings and latency attribution.'
+                else 'No fresh BRTI stream: proxy mode. Final-minute entries are blocked. Streaming book/empirical execution still run when credentials are available.'
             ),
             'error': None,
         }
