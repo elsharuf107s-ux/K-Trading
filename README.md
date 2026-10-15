@@ -4,24 +4,95 @@ K-Trading is a **paper-only AI/quant research engine** for Kalshi's rolling `KXB
 
 It is built to answer one question honestly: **does a forecast still have edge after the actual quote, order-book depth, fees, latency, slippage, partial fills, calibration, and risk controls are applied?**
 
-> **Current build: V0.8 Strategy / Soak Lab. Real-money order submission is not implemented.**
+> **Current build: V0.9 Fast Path + AI Ensemble. Real-money order submission is still intentionally disabled.**
 
-## What is finished in V0.8
+## V0.9 — Fast Path + AI Ensemble
 
-V0.8 adds a chronological strategy evaluator on top of the existing paper engine.
+V0.9 separates slow data/reconciliation work from the trading decision path.
 
-It replays recorded completed-market frames in timestamp order and:
+The normal engine loop still handles REST market discovery, Coinbase/Kraken cross-checks, settlement reconciliation, database analytics, and model training. The new fast path consumes already-synchronized in-memory Kalshi WebSocket order-book data plus the latest BRTI reference and evaluates the paper strategy at **200ms / 5Hz by default**.
 
-- uses only the information that existed in each recorded frame
+That means lowering the fast-path interval does **not** multiply REST traffic.
+
+V0.9 adds:
+
+- 200ms in-memory paper decision path
+- WebSocket-first quote/depth decisions
+- separate fast-path latency telemetry (`last_cycle_ms`, EWMA compute time, cycles, skips, trades)
+- 1-second fast observation persistence for higher-resolution training data
+- bounded asynchronous AI sidecar interface
+- optional Amazon Chronos-2 sidecar service
+- AI failure isolation: slow/offline sidecar never blocks the fast trader
+- sidecar confidence gate, freshness gate, blend weight, and maximum probability-shift cap
+- V0.9 dashboard panel injected without replacing the existing research UI
+- `/api/fast-path` and `/api/ai-sidecar` status endpoints
+
+### Default fast path
+
+```env
+FAST_PATH_ENABLED=true
+FAST_PATH_INTERVAL_MS=200
+FAST_PATH_REQUIRE_STREAM=true
+FAST_PATH_OBSERVATION_INTERVAL_SECONDS=1
+FAST_PATH_MAX_SLOW_STATE_AGE_SECONDS=4
+```
+
+The dashboard should report roughly **5 Hz**. `Cycle compute` is the time spent computing each fast decision; it should remain comfortably below the configured 200ms interval.
+
+## Recommended outcome AI: Amazon Chronos-2
+
+The recommended sidecar for the 15-minute BTC outcome problem is **Amazon Chronos-2** (`amazon/chronos-2`). It is a purpose-built probabilistic time-series foundation model, not a general chat model.
+
+K-Trading sends the sidecar recent BRTI/spot/Kalshi history. The included service forecasts the remaining time series, approximates the final 60-second settlement average, and returns a `P(YES)` vote.
+
+Chronos does **not** control execution. Its vote is blended into the local fast model and then still passes through the same risk and execution layers.
+
+Defaults:
+
+```env
+AI_SIDECAR_ENABLED=false
+AI_SIDECAR_URL=
+AI_SIDECAR_MODEL=amazon/chronos-2
+AI_SIDECAR_WEIGHT=0.20
+AI_SIDECAR_MIN_CONFIDENCE=0.55
+AI_SIDECAR_REQUEST_INTERVAL_SECONDS=5
+AI_SIDECAR_TIMEOUT_SECONDS=2
+AI_SIDECAR_MAX_AGE_SECONDS=15
+AI_SIDECAR_MAX_PROBABILITY_SHIFT=0.08
+```
+
+Full setup: [`docs/AI_SIDECAR.md`](docs/AI_SIDECAR.md)
+
+The optional model dependencies are deliberately separate from the main trading process:
+
+```bash
+pip install -r requirements-chronos.txt
+CHRONOS_DEVICE=cpu bash scripts/run_chronos_sidecar.sh
+```
+
+Then configure:
+
+```env
+AI_SIDECAR_ENABLED=true
+AI_SIDECAR_URL=http://127.0.0.1:8010/forecast
+```
+
+For a lower-resource CPU experiment, use `CHRONOS_MODEL_ID=autogluon/chronos-2-small`. The full `amazon/chronos-2` model is the quality-oriented default.
+
+## V0.8 — Strategy / Soak Lab
+
+V0.8 adds a chronological strategy evaluator on top of the paper engine. It:
+
+- replays recorded completed-market frames in timestamp order
 - keeps final YES/NO settlement out of entry/exit decisions
-- sizes replay trades at one contract per completed market so strategy quality is not confused with bankroll sizing
-- runs the same depth-aware fee/latency execution simulator used by the paper engine
-- tracks replay P&L, win rate, direction accuracy, fees, hold time, maximum drawdown, and consecutive losses
+- sizes replay trades at one contract per completed market
+- uses the same depth-aware fee/latency execution simulator
+- tracks P&L, win rate, fees, hold time, maximum drawdown, and loss streaks
 - breaks performance down by edge bucket, entry time, wave strength, reference source, side, and exit reason
 - stores the last report at `data/strategy_eval.json`
-- exposes explicit research gates instead of presenting raw P&L as permission to go live
+- exposes explicit PASS/FAIL research gates
 
-### Research gate defaults
+Default gate:
 
 ```env
 SOAK_MIN_COMPLETED_WINDOWS=200
@@ -34,46 +105,43 @@ SOAK_MIN_EXECUTION_FILL_RATE=0.50
 SOAK_MIN_EMPIRICAL_SAMPLES=500
 ```
 
-Passing these gates only means **GO_FOR_MORE_PAPER_RESEARCH**. It does not approve or prove safe/profitable live trading.
+Passing means **GO_FOR_MORE_PAPER_RESEARCH**, not permission to trade real money.
 
 ## Earlier layers retained
 
 ### V0.7 — empirical execution learning
 
-- authenticated Kalshi `orderbook_delta` WebSocket for the active contract
-- initial snapshot + sequenced deltas
-- sequence-gap detection and forced resync
-- fresh WebSocket book preferred over REST fallback
+- authenticated Kalshi `orderbook_delta` WebSocket
+- snapshot + sequenced deltas and sequence-gap resync
 - measured 100/250/500/1000 ms quote movement
-- SQLite persistence of empirical quote moves
+- persistent empirical quote-move distributions
 - p95 adverse-movement latency recommendation
-- optional empirical latency override, disabled by default until the sample gate is met
-- automatic model-lab retraining after configurable newly completed windows
+- optional empirical latency override
+- automatic model-lab retraining
 
 ### V0.6 — shadow edge attribution
 
-- records entry execution attempts even when they are rejected
+- records rejected as well as filled entry attempts
 - separates gross model edge from executable edge
-- tracks fee drag, depth slippage, latency slippage, rejected attempts, and no-liquidity attempts
-- blocks entries when source agreement or executable depth is unhealthy
+- measures fee, depth, and latency drag
+- blocks unhealthy source/depth conditions
 
 ### V0.5 — realistic paper execution
 
-- walks visible YES/NO depth instead of filling everything at the top quote
+- walks visible book depth
 - supports partial fills
-- models configurable fees and latency
-- rejects entries when execution friction destroys the minimum edge
-- carries entry fees through paper P&L and partial exits
+- models fees and latency
+- rejects trades whose edge disappears after execution friction
 
 ### V0.4 — model lab
 
 - trains only on completed markets
-- keeps whole market windows together across train/test splits
-- uses chronological expanding walk-forward validation
-- compares learned challengers against the live Kalshi probability baseline
-- promotes a model only after configured out-of-sample improvement
+- keeps complete market windows together across splits
+- uses chronological walk-forward validation
+- compares candidates against the Kalshi probability baseline
+- promotes only after configured out-of-sample improvement
 
-## Run it
+## Run K-Trading
 
 In GitHub Codespaces or Linux:
 
@@ -83,7 +151,7 @@ pip install -r requirements.txt
 ./scripts/run.sh
 ```
 
-Then open forwarded port **8000**.
+Open forwarded port **8000**.
 
 Direct run:
 
@@ -91,28 +159,22 @@ Direct run:
 uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 ```
 
-The dashboard is at `/`.
-
-## Test V0.8
-
-1. Start the server and open port 8000.
-2. Let K-Trading collect observations and completed markets.
-3. In the dashboard, click **Run Strategy Eval**.
-4. Review the replay metrics and the individual PASS/FAIL research gates.
-5. For raw JSON, use:
+Useful endpoints:
 
 ```text
-GET  /api/strategy-eval
-POST /api/strategy-eval/run
-GET  /api/research-gate
 GET  /api/health
 GET  /api/state
+GET  /api/fast-path
+GET  /api/ai-sidecar
 GET  /api/analytics
 GET  /api/execution
 GET  /api/empirical-execution
+GET  /api/model-lab
+POST /api/model-lab/train
+GET  /api/strategy-eval
+POST /api/strategy-eval/run
+GET  /api/research-gate
 ```
-
-If you do not have many completed windows yet, the evaluator can still run, but the gate should remain `NOT_READY`.
 
 ## Kalshi authenticated feeds
 
@@ -125,43 +187,16 @@ ENABLE_KALSHI_WS=true
 CFBENCHMARKS_INDEX_ID=BRTI
 ```
 
-These credentials power BRTI/reference and order-book market-data streaming. They do **not** enable live order submission in this build.
-
-## Important V0.7 settings
-
-```env
-ORDERBOOK_STREAM_STALE_SECONDS=2
-EMPIRICAL_QUOTE_HORIZONS_MS=100,250,500,1000
-EMPIRICAL_LATENCY_MIN_SAMPLES=200
-USE_EMPIRICAL_LATENCY=false
-AUTO_MODEL_TRAIN=true
-AUTO_TRAIN_EVERY_WINDOWS=16
-```
-
-Keep `USE_EMPIRICAL_LATENCY=false` until you have enough real measurements and have reviewed them.
+These credentials power authenticated BRTI/reference and order-book market-data streaming. They do **not** enable live order submission.
 
 ## Tests
 
 ```bash
 pytest -q
-python -m compileall app tests
+python -m compileall app tests services
 ```
 
-The test suite covers:
-
-- reference/BRTI handling
-- Kalshi order-book snapshot and delta parsing
-- sequence-gap invalidation
-- fee rounding and paper accounting
-- depth-aware and partial fills
-- depth-vs-latency slippage attribution
-- shadow execution persistence
-- empirical latency sampling and recommendations
-- grouped chronological model training
-- strategy replay chronology
-- settlement no-lookahead behavior
-- drawdown/loss-streak calculations
-- research-gate pass/fail logic
+The suite covers reference/BRTI handling, order-book streaming and gap invalidation, realistic execution/accounting, empirical latency, grouped model training, chronological replay, settlement no-lookahead, research gates, V0.9 buffer handling, bounded AI sidecar blending, and proof that a fast-path decision does not call REST market discovery.
 
 ## Safety / research rules
 
@@ -169,8 +204,8 @@ The test suite covers:
 2. Real-money order submission remains disabled.
 3. Win rate alone is not the objective; after-cost expected value is.
 4. Never use final settlement data to influence a historical decision frame.
-5. Never treat a small backtest or replay sample as proof of edge.
+5. Never treat a small backtest/replay sample as proof of edge.
 6. Keep model error and execution drag separate.
 7. Treat stale, missing, disagreeing, or sequence-broken data as a risk condition.
-8. Keep empirical latency disabled until the measured sample is large enough.
-9. A passing V0.8 gate means continue paper research, not go live.
+8. A slow or broken AI sidecar must never block or control execution.
+9. A passing research gate means continue paper research, not go live.
