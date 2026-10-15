@@ -16,8 +16,8 @@ class ResearchAnalytics:
     """Out-of-sample-friendly research summaries from already-recorded observations.
 
     These metrics do not prove profitability. They tell us whether probability
-    forecasts are calibrated and whether they beat the live market probability
-    baseline on completed windows.
+    forecasts are calibrated, whether they beat the live market probability
+    baseline, and how much execution friction the paper strategy is paying.
     """
 
     def __init__(self, storage: Storage):
@@ -55,6 +55,7 @@ class ResearchAnalytics:
                 'average_loss': sum(losses) / len(losses) if losses else None,
                 'profit_factor': None if profit_factor is None else (profit_factor if profit_factor != inf else 'inf'),
             },
+            'execution': self.storage.execution_metrics(),
             'warning': 'Calibration/Brier need many independent completed windows; correlated snapshots are shown for diagnosis only.',
         }
 
