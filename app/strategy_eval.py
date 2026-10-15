@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 import json
 import math
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 from .config import settings
 from .execution import ExecutionSimulator
@@ -71,27 +71,30 @@ class StrategyEvaluator:
             return None
         return data if isinstance(data, dict) else None
 
-    def _completed_windows(self, limit: int = 100_000) -> list[dict[str, Any]]:
-        rows = self.storage.db.execute(
-            '''SELECT o.ticker,o.created_at,o.usable_json,r.result,r.settled_at
-               FROM observations o JOIN market_results r ON r.ticker=o.ticker
-               ORDER BY o.created_at ASC,o.id ASC LIMIT ?''',
-            (int(limit),),
+    def _completed_windows(self) -> Iterator[dict[str, Any]]:
+        """Yield every completed window oldest-first, loading one window's frames at a time."""
+        windows = self.storage.db.execute(
+            '''SELECT w.ticker,r.result,r.settled_at
+               FROM market_windows w JOIN market_results r ON r.ticker=w.ticker
+               ORDER BY w.first_observation_id ASC'''
         ).fetchall()
-        grouped: dict[str, dict[str, Any]] = {}
-        for ticker, created_at, payload, result, settled_at in rows:
-            item = grouped.setdefault(str(ticker), {
-                'ticker': str(ticker),
-                'result': str(result).lower(),
-                'settled_at': settled_at,
-                'frames': [],
-            })
-            try:
-                parsed = json.loads(payload)
-            except Exception:
+        for ticker, result, settled_at in windows:
+            result = str(result).lower()
+            if result not in ('yes', 'no'):
                 continue
-            item['frames'].append({'created_at': str(created_at), **parsed})
-        return [item for item in grouped.values() if item['frames'] and item['result'] in ('yes', 'no')]
+            rows = self.storage.db.execute(
+                'SELECT created_at,usable_json FROM observations WHERE ticker=? ORDER BY created_at ASC,id ASC',
+                (ticker,),
+            ).fetchall()
+            frames = []
+            for created_at, payload in rows:
+                try:
+                    parsed = json.loads(payload)
+                except Exception:
+                    continue
+                frames.append({'created_at': str(created_at), **parsed})
+            if frames:
+                yield {'ticker': str(ticker), 'result': result, 'settled_at': settled_at, 'frames': frames}
 
     @staticmethod
     def _frame(frame: dict[str, Any]) -> tuple[MarketSnapshot, FeatureVector, Forecast] | None:
@@ -327,10 +330,11 @@ class StrategyEvaluator:
         }
 
     def run(self) -> dict[str, Any]:
-        windows = self._completed_windows()
         trades: list[dict[str, Any]] = []
+        completed = 0
         skipped = 0
-        for window in windows:
+        for window in self._completed_windows():
+            completed += 1
             trade = self._replay_window(window)
             if trade is None:
                 skipped += 1
@@ -346,10 +350,10 @@ class StrategyEvaluator:
         equity = self._equity_metrics(trades)
 
         metrics = {
-            'completed_windows': len(windows),
+            'completed_windows': completed,
             'traded_windows': len(trades),
             'skipped_windows': skipped,
-            'trade_rate': _safe_div(len(trades), len(windows)),
+            'trade_rate': _safe_div(len(trades), completed),
             'net_pnl_per_contract_strategy': sum(pnl),
             'average_pnl': _safe_div(sum(pnl), len(pnl)),
             'win_rate': _safe_div(len(wins), len(trades)),

@@ -154,7 +154,7 @@ class TradingEngine:
             return
         if self._auto_train_task and not self._auto_train_task.done():
             return
-        windows = len(self.storage.last_labeled_observations(limit=100_000))
+        windows = self.storage.completed_window_count()
         if windows < settings.model_min_windows:
             self._auto_train_state = {
                 'enabled': True,

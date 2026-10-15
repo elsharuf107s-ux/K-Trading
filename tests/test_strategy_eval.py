@@ -192,3 +192,24 @@ def test_research_gate_explains_failure_and_can_pass_dev_thresholds(tmp_path, mo
     )
     assert passed['passed'] is True
     assert passed['status'] == 'GO_FOR_MORE_PAPER_RESEARCH'
+
+
+def test_replay_includes_newest_window_after_long_history(tmp_path, monkeypatch):
+    # Regression: the replay used to load only the oldest 100k observation rows,
+    # silently dropping every newer window once ~1 day of 1 Hz frames existed.
+    monkeypatch.setattr(settings, 'sim_latency_ms', 0.0)
+    storage = Storage(str(tmp_path / 'long_history.sqlite3'))
+    storage.db.executemany(
+        '''INSERT INTO observations(created_at,ticker,btc_price,market_probability,usable_json)
+           VALUES('2025-12-31T00:00:00+00:00','KXBTC15M-OLD',100000,0.5,'{}')''',
+        [()] * 100_001,
+    )
+    storage.db.commit()
+    storage.save_market_result('KXBTC15M-OLD', 'no')
+    storage = Storage(str(tmp_path / 'long_history.sqlite3'))
+    _save_window(storage, 0, 'yes')
+
+    report = StrategyEvaluator(storage, tmp_path / 'report.json').run()
+    assert report['metrics']['completed_windows'] == 2
+    assert report['metrics']['traded_windows'] == 1
+    assert report['trades'][0]['ticker'] == 'KXBTC15M-EVAL-000'

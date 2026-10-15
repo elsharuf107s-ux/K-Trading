@@ -39,9 +39,16 @@ class Storage:
         CREATE TABLE IF NOT EXISTS paper_state (
             id INTEGER PRIMARY KEY CHECK(id=1),updated_at TEXT NOT NULL,state_json TEXT NOT NULL
         );
+        -- One row per observed market so window-level queries stay O(windows)
+        -- instead of scanning every observation on each engine cycle.
+        CREATE TABLE IF NOT EXISTS market_windows (
+            ticker TEXT PRIMARY KEY,first_observation_id INTEGER NOT NULL,last_observation_id INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_observations_ticker ON observations(ticker,id);
         ''')
         self._migrate_observations()
         self._migrate_trades()
+        self._sync_market_windows()
         self.db.commit()
 
     def _migrate_observations(self):
@@ -66,6 +73,18 @@ class Storage:
         for name, typ in additions.items():
             if name not in columns:
                 self.db.execute(f'ALTER TABLE trades ADD COLUMN {name} {typ}')
+
+    def _sync_market_windows(self):
+        # Backfills databases created before market_windows existed (and any
+        # rows written by older builds); save_observation keeps it current.
+        known = self.db.execute('SELECT COALESCE(MAX(last_observation_id),0) FROM market_windows').fetchone()[0]
+        self.db.execute(
+            '''INSERT INTO market_windows(ticker,first_observation_id,last_observation_id)
+               SELECT ticker,MIN(id),MAX(id) FROM observations WHERE id>? GROUP BY ticker
+               ON CONFLICT(ticker) DO UPDATE SET
+               last_observation_id=MAX(last_observation_id,excluded.last_observation_id)''',
+            (known,),
+        )
 
     def save_paper_state(self, state: dict[str, Any]) -> None:
         now = datetime.now(timezone.utc).isoformat()
@@ -92,7 +111,7 @@ class Storage:
             'features': features.model_dump(mode='json'),
             'forecast': forecast.model_dump(mode='json'),
         }
-        self.db.execute(
+        cur = self.db.execute(
             '''INSERT INTO observations(created_at,ticker,btc_price,market_probability,yes_bid,yes_ask,no_bid,no_ask,
                seconds_remaining,model_probability,confidence,reference_price,reference_source,book_imbalance,wave_score,usable_json)
                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',
@@ -102,6 +121,11 @@ class Storage:
                 forecast.yes_probability, forecast.confidence, features.reference_price, features.reference_source,
                 features.book_imbalance, features.wave_score, json.dumps(payload),
             ),
+        )
+        self.db.execute(
+            '''INSERT INTO market_windows(ticker,first_observation_id,last_observation_id) VALUES(?,?,?)
+               ON CONFLICT(ticker) DO UPDATE SET last_observation_id=excluded.last_observation_id''',
+            (market.ticker, cur.lastrowid, cur.lastrowid),
         )
         self.db.commit()
 
@@ -200,11 +224,25 @@ class Storage:
 
     def unresolved_tickers(self, current_ticker: str = '', limit: int = 10) -> list[str]:
         cur = self.db.execute(
-            '''SELECT DISTINCT o.ticker FROM observations o LEFT JOIN market_results r ON r.ticker=o.ticker
-               WHERE r.ticker IS NULL AND o.ticker<>? ORDER BY o.id DESC LIMIT ?''',
+            '''SELECT w.ticker FROM market_windows w LEFT JOIN market_results r ON r.ticker=w.ticker
+               WHERE r.ticker IS NULL AND w.ticker<>? ORDER BY w.last_observation_id DESC LIMIT ?''',
             (current_ticker, limit),
         )
         return [row[0] for row in cur.fetchall()]
+
+    def completed_window_count(self) -> int:
+        row = self.db.execute(
+            'SELECT COUNT(*) FROM market_windows w JOIN market_results r ON r.ticker=w.ticker'
+        ).fetchone()
+        return int(row[0])
+
+    def labels_version(self) -> tuple[int, int]:
+        """Changes whenever a market is labeled or a labeled market gains observations."""
+        row = self.db.execute(
+            '''SELECT COUNT(*),COALESCE(MAX(w.last_observation_id),0)
+               FROM market_windows w JOIN market_results r ON r.ticker=w.ticker'''
+        ).fetchone()
+        return int(row[0]), int(row[1])
 
     def recent_trades(self, limit: int = 50) -> list[dict]:
         cur = self.db.execute(
@@ -265,9 +303,9 @@ class Storage:
         cur = self.db.execute(
             '''SELECT o.created_at,o.ticker,o.market_probability,o.model_probability,o.seconds_remaining,r.result,
                CASE WHEN r.result='yes' THEN 1.0 ELSE 0.0 END outcome_yes
-               FROM observations o
-               JOIN (SELECT ticker,MAX(id) max_id FROM observations GROUP BY ticker) x ON x.max_id=o.id
-               JOIN market_results r ON r.ticker=o.ticker ORDER BY o.id DESC LIMIT ?''',
+               FROM market_windows w
+               JOIN market_results r ON r.ticker=w.ticker
+               JOIN observations o ON o.id=w.last_observation_id ORDER BY o.id DESC LIMIT ?''',
             (limit,),
         )
         keys = ['created_at', 'ticker', 'market_probability', 'model_probability', 'seconds_remaining', 'result', 'outcome_yes']

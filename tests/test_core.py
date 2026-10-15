@@ -230,3 +230,28 @@ def test_unresolved_market_tracking(tmp_path):
     assert m.ticker in st.unresolved_tickers('KXBTC15M-CURRENT')
     st.save_market_result(m.ticker, 'no')
     assert m.ticker not in st.unresolved_tickers('KXBTC15M-CURRENT')
+
+
+def test_market_windows_backfill_for_existing_databases(tmp_path):
+    from app.storage import Storage
+    path = str(tmp_path / 'legacy.sqlite3')
+    st = Storage(path)
+    for ticker in ('KXBTC15M-A', 'KXBTC15M-A', 'KXBTC15M-B', 'KXBTC15M-C'):
+        m = market(ticker=ticker)
+        f = build_features(m, BtcSnapshot(price=100000, sources={'a': 100000}), PriceBuffer(), MarketBuffer())
+        st.save_observation(m, f, BaselineForecaster().predict(f))
+    st.save_market_result('KXBTC15M-A', 'yes')
+    # Simulate a database written before the market_windows table existed.
+    st.db.execute('DROP TABLE market_windows')
+    st.db.commit()
+
+    reopened = Storage(path)
+    assert reopened.completed_window_count() == 1
+    assert reopened.unresolved_tickers('KXBTC15M-C') == ['KXBTC15M-B']
+    labeled = reopened.last_labeled_observations()
+    assert [row['ticker'] for row in labeled] == ['KXBTC15M-A']
+    last_a = reopened.db.execute("SELECT MAX(id) FROM observations WHERE ticker='KXBTC15M-A'").fetchone()[0]
+    window = reopened.db.execute(
+        "SELECT first_observation_id,last_observation_id FROM market_windows WHERE ticker='KXBTC15M-A'"
+    ).fetchone()
+    assert window == (1, last_a)
