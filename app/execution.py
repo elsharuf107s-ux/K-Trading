@@ -59,6 +59,7 @@ class ExecutionSimulator:
         intent: str,
         quantity: int,
         wave_score: float = 0.0,
+        latency_penalty_override: float | None = None,
     ) -> ExecutionFill:
         requested = max(0, int(quantity))
         if requested < 1:
@@ -90,7 +91,11 @@ class ExecutionSimulator:
         adjusted_notional = 0.0
         fees = 0.0
         fills = 0
-        penalty = self._latency_penalty(wave_score)
+        penalty = (
+            self._latency_penalty(wave_score)
+            if latency_penalty_override is None
+            else max(0.0, min(settings.sim_max_latency_slippage, float(latency_penalty_override)))
+        )
 
         for raw_price, raw_qty in book:
             if remaining <= 0:
@@ -134,6 +139,8 @@ class ExecutionSimulator:
         complete = filled == requested
         fill_fraction = filled / requested
         reason = 'Complete taker fill' if complete else f'Partial taker fill ({filled}/{requested})'
+        if latency_penalty_override is not None:
+            reason += '; empirical latency penalty'
         if total_slippage > settings.sim_max_execution_slippage:
             reason += '; execution slippage exceeds configured limit'
         if fill_fraction < settings.sim_min_fill_fraction:
