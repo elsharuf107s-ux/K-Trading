@@ -23,7 +23,8 @@ class Storage:
         );
         CREATE TABLE IF NOT EXISTS trades (
             id INTEGER PRIMARY KEY AUTOINCREMENT,created_at TEXT NOT NULL,ticker TEXT NOT NULL,side TEXT NOT NULL,
-            action TEXT NOT NULL,quantity INTEGER NOT NULL,price REAL NOT NULL,pnl REAL NOT NULL,reason TEXT NOT NULL
+            action TEXT NOT NULL,quantity INTEGER NOT NULL,price REAL NOT NULL,pnl REAL NOT NULL,
+            fee REAL NOT NULL DEFAULT 0,requested_quantity INTEGER,slippage REAL NOT NULL DEFAULT 0,reason TEXT NOT NULL
         );
         CREATE TABLE IF NOT EXISTS market_results (
             ticker TEXT PRIMARY KEY,result TEXT NOT NULL,settled_at TEXT NOT NULL
@@ -33,6 +34,7 @@ class Storage:
         );
         ''')
         self._migrate_observations()
+        self._migrate_trades()
         self.db.commit()
 
     def _migrate_observations(self):
@@ -46,6 +48,17 @@ class Storage:
         for name, typ in additions.items():
             if name not in columns:
                 self.db.execute(f'ALTER TABLE observations ADD COLUMN {name} {typ}')
+
+    def _migrate_trades(self):
+        columns = {row[1] for row in self.db.execute('PRAGMA table_info(trades)').fetchall()}
+        additions = {
+            'fee': 'REAL NOT NULL DEFAULT 0',
+            'requested_quantity': 'INTEGER',
+            'slippage': 'REAL NOT NULL DEFAULT 0',
+        }
+        for name, typ in additions.items():
+            if name not in columns:
+                self.db.execute(f'ALTER TABLE trades ADD COLUMN {name} {typ}')
 
     def save_paper_state(self, state: dict[str, Any]) -> None:
         now = datetime.now(timezone.utc).isoformat()
@@ -87,8 +100,12 @@ class Storage:
 
     def save_trade(self, trade: TradeRecord):
         self.db.execute(
-            'INSERT INTO trades(created_at,ticker,side,action,quantity,price,pnl,reason) VALUES(?,?,?,?,?,?,?,?)',
-            (trade.created_at.isoformat(), trade.ticker, trade.side, trade.action, trade.quantity, trade.price, trade.pnl, trade.reason),
+            '''INSERT INTO trades(created_at,ticker,side,action,quantity,price,pnl,fee,requested_quantity,slippage,reason)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?)''',
+            (
+                trade.created_at.isoformat(), trade.ticker, trade.side, trade.action, trade.quantity,
+                trade.price, trade.pnl, trade.fee, trade.requested_quantity, trade.slippage, trade.reason,
+            ),
         )
         self.db.commit()
 
@@ -114,19 +131,49 @@ class Storage:
 
     def recent_trades(self, limit: int = 50) -> list[dict]:
         cur = self.db.execute(
-            'SELECT created_at,ticker,side,action,quantity,price,pnl,reason FROM trades ORDER BY id DESC LIMIT ?',
+            '''SELECT created_at,ticker,side,action,quantity,requested_quantity,price,pnl,fee,slippage,reason
+               FROM trades ORDER BY id DESC LIMIT ?''',
             (limit,),
         )
-        keys = ['created_at', 'ticker', 'side', 'action', 'quantity', 'price', 'pnl', 'reason']
+        keys = ['created_at', 'ticker', 'side', 'action', 'quantity', 'requested_quantity', 'price', 'pnl', 'fee', 'slippage', 'reason']
         return [dict(zip(keys, row)) for row in cur.fetchall()]
 
     def closed_trade_records(self, limit: int = 20000) -> list[dict]:
         cur = self.db.execute(
-            "SELECT created_at,ticker,side,action,quantity,price,pnl,reason FROM trades WHERE action IN ('close','settle') ORDER BY id DESC LIMIT ?",
+            '''SELECT created_at,ticker,side,action,quantity,requested_quantity,price,pnl,fee,slippage,reason
+               FROM trades WHERE action IN ('close','settle') ORDER BY id DESC LIMIT ?''',
             (limit,),
         )
-        keys = ['created_at', 'ticker', 'side', 'action', 'quantity', 'price', 'pnl', 'reason']
+        keys = ['created_at', 'ticker', 'side', 'action', 'quantity', 'requested_quantity', 'price', 'pnl', 'fee', 'slippage', 'reason']
         return [dict(zip(keys, row)) for row in cur.fetchall()]
+
+    def execution_metrics(self, limit: int = 20000) -> dict[str, float | int]:
+        rows = self.db.execute(
+            '''SELECT quantity,requested_quantity,fee,slippage FROM trades
+               WHERE action IN ('open','close') ORDER BY id DESC LIMIT ?''',
+            (limit,),
+        ).fetchall()
+        if not rows:
+            return {
+                'fills': 0,
+                'requested_contracts': 0,
+                'filled_contracts': 0,
+                'fill_rate': 0.0,
+                'fees': 0.0,
+                'average_slippage': 0.0,
+            }
+        filled = sum(int(row[0] or 0) for row in rows)
+        requested = sum(int(row[1] if row[1] is not None else row[0] or 0) for row in rows)
+        fees = sum(float(row[2] or 0.0) for row in rows)
+        weighted_slippage = sum(float(row[3] or 0.0) * int(row[0] or 0) for row in rows)
+        return {
+            'fills': len(rows),
+            'requested_contracts': requested,
+            'filled_contracts': filled,
+            'fill_rate': filled / requested if requested > 0 else 0.0,
+            'fees': fees,
+            'average_slippage': weighted_slippage / filled if filled > 0 else 0.0,
+        }
 
     def recent_observations(self, limit: int = 200) -> list[dict]:
         cur = self.db.execute(
