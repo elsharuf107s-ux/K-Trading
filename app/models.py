@@ -29,9 +29,6 @@ class MarketSnapshot(BaseModel):
     yes_depth: float = 0.0
     no_depth: float = 0.0
     book_imbalance: float = 0.0
-    # Kalshi publishes YES bids and NO bids. We preserve them so the paper
-    # executor can derive asks and walk real visible depth instead of filling
-    # the whole order at the top quote.
     yes_book: list[tuple[float, float]] = Field(default_factory=list)
     no_book: list[tuple[float, float]] = Field(default_factory=list)
     captured_at: datetime = Field(default_factory=utc_now)
@@ -126,10 +123,32 @@ class ExecutionFill(BaseModel):
     top_price: float = 0.0
     fee: float = 0.0
     slippage: float = 0.0
+    depth_slippage: float = 0.0
+    latency_slippage: float = 0.0
     latency_ms: float = 0.0
     levels_consumed: int = 0
     complete: bool = False
     reason: str = ''
+
+
+class ExecutionEvent(BaseModel):
+    ticker: str
+    side: Literal['yes', 'no']
+    intent: Literal['buy', 'sell']
+    status: Literal['filled', 'partial', 'rejected', 'no_liquidity']
+    requested_quantity: int
+    filled_quantity: int
+    fair_probability: float = 0.0
+    top_price: float = 0.0
+    average_price: float = 0.0
+    gross_edge_before: float = 0.0
+    executable_edge_after: float = 0.0
+    fee: float = 0.0
+    depth_slippage: float = 0.0
+    latency_slippage: float = 0.0
+    total_slippage: float = 0.0
+    reason: str = ''
+    created_at: datetime = Field(default_factory=utc_now)
 
 
 class PaperPosition(BaseModel):
