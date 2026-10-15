@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -10,9 +11,11 @@ from pydantic import BaseModel
 
 from .analytics import ResearchAnalytics
 from .engine import TradingEngine
+from .model_lab import ModelLab
 
 engine = TradingEngine()
 analytics = ResearchAnalytics(engine.storage)
+model_lab = ModelLab(engine.storage, engine.model_registry)
 
 
 @asynccontextmanager
@@ -22,7 +25,7 @@ async def lifespan(app: FastAPI):
     await engine.stop()
 
 
-app = FastAPI(title='K-Trading', version='0.3.0', lifespan=lifespan)
+app = FastAPI(title='K-Trading', version='0.4.0', lifespan=lifespan)
 
 WEB_DIR = Path(__file__).resolve().parent.parent / 'web'
 if WEB_DIR.exists():
@@ -45,6 +48,7 @@ async def health():
         'status': engine.last_state.get('status'),
         'mode': 'paper',
         'benchmark_stream': engine.benchmark_stream.status(),
+        'model_registry': engine.model_registry.status(),
     }
 
 
@@ -66,6 +70,19 @@ async def observations(limit: int = 200):
 @app.get('/api/analytics')
 async def research_analytics():
     return analytics.summary()
+
+
+@app.get('/api/model-lab')
+async def model_lab_status():
+    return engine.model_registry.status()
+
+
+@app.post('/api/model-lab/train')
+async def train_model_lab():
+    try:
+        return await asyncio.to_thread(model_lab.train)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f'Model lab failed: {type(exc).__name__}: {exc}') from exc
 
 
 @app.get('/api/replay/{ticker}')
