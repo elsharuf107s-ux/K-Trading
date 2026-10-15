@@ -56,6 +56,7 @@ class ResearchAnalytics:
                 'profit_factor': None if profit_factor is None else (profit_factor if profit_factor != inf else 'inf'),
             },
             'execution': self.storage.execution_metrics(),
+            'execution_attribution': self.storage.execution_attribution(),
             'warning': 'Calibration/Brier need many independent completed windows; correlated snapshots are shown for diagnosis only.',
         }
 
