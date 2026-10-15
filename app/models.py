@@ -76,7 +76,11 @@ class FeatureVector(BaseModel):
     momentum_30s: float = 0.0
     momentum_60s: float = 0.0
     momentum_180s: float = 0.0
+    reference_momentum_10s: float = 0.0
+    reference_momentum_30s: float = 0.0
+    reference_momentum_60s: float = 0.0
     realized_vol_60s: float = 0.0
+    reference_vol_60s: float = 0.0
     source_dispersion: float = 0.0
     target_price: float | None = None
     distance_to_target_bps: float | None = None
@@ -93,7 +97,7 @@ class Forecast(BaseModel):
     yes_probability: float
     confidence: float
     rationale: list[str]
-    model_name: str = 'market-anchor-wave-v2'
+    model_name: str = 'market-anchor-wave-v3'
 
 
 class Decision(BaseModel):
