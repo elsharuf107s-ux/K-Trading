@@ -12,10 +12,13 @@ from pydantic import BaseModel
 from .analytics import ResearchAnalytics
 from .engine import TradingEngine
 from .model_lab import ModelLab
+from .strategy_eval import ResearchGate, StrategyEvaluator
 
 engine = TradingEngine()
 analytics = ResearchAnalytics(engine.storage)
 model_lab = ModelLab(engine.storage, engine.model_registry)
+strategy_eval = StrategyEvaluator(engine.storage)
+research_gate = ResearchGate(engine.storage, strategy_eval)
 
 
 @asynccontextmanager
@@ -25,7 +28,7 @@ async def lifespan(app: FastAPI):
     await engine.stop()
 
 
-app = FastAPI(title='K-Trading', version='0.7.0', lifespan=lifespan)
+app = FastAPI(title='K-Trading', version='0.8.0', lifespan=lifespan)
 
 WEB_DIR = Path(__file__).resolve().parent.parent / 'web'
 if WEB_DIR.exists():
@@ -39,6 +42,14 @@ class KillSwitchRequest(BaseModel):
 @app.get('/')
 async def dashboard():
     return FileResponse(WEB_DIR / 'index.html')
+
+
+def _gate_payload(strategy_report=None):
+    return research_gate.evaluate(
+        analytics.summary(),
+        engine.empirical.summary(engine.orderbook_stream.horizons_ms),
+        strategy_report=strategy_report,
+    )
 
 
 @app.get('/api/health')
@@ -56,6 +67,7 @@ async def health():
         'execution': engine.storage.execution_metrics(),
         'execution_attribution': engine.storage.execution_attribution(),
         'empirical_latency': engine.last_state.get('empirical_latency_model') or engine._latency_model(),
+        'research_gate': _gate_payload(),
     }
 
 
@@ -119,6 +131,29 @@ async def train_model_lab():
         return await asyncio.to_thread(model_lab.train)
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f'Model lab failed: {type(exc).__name__}: {exc}') from exc
+
+
+@app.get('/api/strategy-eval')
+async def strategy_evaluation():
+    report = strategy_eval.last_report()
+    return report or {
+        'status': 'not_run',
+        'message': 'Run POST /api/strategy-eval/run after completed windows have been collected.',
+    }
+
+
+@app.post('/api/strategy-eval/run')
+async def run_strategy_evaluation():
+    try:
+        report = await asyncio.to_thread(strategy_eval.run)
+        return {**report, 'research_gate': _gate_payload(report)}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f'Strategy evaluation failed: {type(exc).__name__}: {exc}') from exc
+
+
+@app.get('/api/research-gate')
+async def research_gate_status():
+    return _gate_payload()
 
 
 @app.get('/api/replay/{ticker}')
