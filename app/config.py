@@ -42,16 +42,13 @@ class Settings(BaseSettings):
     daily_loss_limit_usd: float = 50.0
     max_drawdown_fraction: float = 0.10
 
-    # V0.4 model lab. A learned model can only become champion after grouped,
-    # chronological out-of-sample evaluation beats the live-market baseline.
+    # V0.4 model lab.
     model_dir: str = 'data/models'
     enable_learned_model: bool = True
     model_min_windows: int = 24
     model_min_brier_gain: float = 0.002
 
-    # V0.5 execution simulator. Fee settings mirror the July 2026 general
-    # event-contract schedule and stay configurable because Kalshi can change
-    # schedules or apply series-specific multipliers.
+    # V0.5 execution simulator.
     execution_book_depth: int = 20
     sim_taker_fee_rate: float = 0.07
     sim_taker_fee_multiplier: float = 1.0
@@ -62,6 +59,12 @@ class Settings(BaseSettings):
     sim_max_latency_slippage: float = 0.01
     sim_max_execution_slippage: float = 0.03
     sim_min_fill_fraction: float = 0.25
+
+    # V0.6 data-health / shadow-attribution gates.
+    require_orderbook_for_entry: bool = True
+    min_execution_side_depth: float = 1.0
+    max_source_dispersion: float = 0.003
+    max_market_snapshot_age_seconds: float = 5.0
 
     coinbase_spot_url: str = 'https://api.coinbase.com/v2/prices/BTC-USD/spot'
     kraken_ticker_url: str = 'https://api.kraken.com/0/public/Ticker?pair=XBTUSD'
