@@ -29,7 +29,7 @@ def _find_numeric(payload: Any) -> float | None:
         except Exception:
             return _float(payload)
     if isinstance(payload, dict):
-        for key in ('value', 'price', 'index_value', 'rate'):
+        for key in ('value', 'value_usd', 'price', 'index_value', 'rate'):
             val = _float(payload.get(key))
             if val is not None and val > 100:
                 return val
@@ -48,9 +48,11 @@ def _find_numeric(payload: Any) -> float | None:
 class CFBenchmarkStream:
     """Authenticated Kalshi CF Benchmarks stream.
 
-    The app runs without credentials; in that case this object stays disabled and
-    Coinbase/Kraken remain proxy features. With credentials, BRTI becomes the
-    primary reference-data path.
+    K-Trading subscribes to the once-per-second ``cfbenchmarks_value`` channel
+    because it includes the trailing 60-second average and the special
+    quarter-hour final-minute average used by KXBTC15M settlement. The 5Hz
+    sibling is accepted by the parser as a raw-value fallback, but it does not
+    carry those averages.
     """
 
     def __init__(self):
@@ -85,6 +87,7 @@ class CFBenchmarkStream:
         return {
             'enabled': self.enabled,
             'connected': self.connected,
+            'channel': 'cfbenchmarks_value',
             'index_id': settings.cfbenchmarks_index_id,
             'last_message_at': self.last_message_at.isoformat() if self.last_message_at else None,
             'error': self.error,
@@ -124,7 +127,7 @@ class CFBenchmarkStream:
                 'id': 1,
                 'cmd': 'subscribe',
                 'params': {
-                    'channels': ['cfbenchmarks_value_5hz'],
+                    'channels': ['cfbenchmarks_value'],
                     'index_ids': [settings.cfbenchmarks_index_id],
                 },
             }
@@ -146,22 +149,34 @@ class CFBenchmarkStream:
             return
         if msg_type not in ('cfbenchmarks_value', 'cfbenchmarks_value_5hz'):
             return
+
         msg = message.get('msg') or {}
-        if str(msg.get('index_id') or '') not in ('', settings.cfbenchmarks_index_id):
+        index_id = str(msg.get('index_id') or '')
+        if index_id not in ('', settings.cfbenchmarks_index_id):
             return
 
+        previous = self.latest if self.latest and self.latest.index_id == (index_id or settings.cfbenchmarks_index_id) else None
         avg = msg.get('avg_60s_data') or {}
         settlement = msg.get('last_60s_windowed_average_15min') or {}
-        raw_value = _find_numeric(msg.get('data'))
+
+        raw_value = _float(msg.get('value_usd')) or _find_numeric(msg.get('data'))
         avg_value = _float(avg.get('value'))
         settlement_value = _float(settlement.get('value'))
+
+        # The 5Hz channel intentionally omits average fields. If one of those
+        # frames is ever routed here, preserve the last settlement-aware values
+        # instead of replacing them with None.
+        if msg_type == 'cfbenchmarks_value_5hz' and previous:
+            avg_value = avg_value if avg_value is not None else previous.avg_60s
+            settlement_value = settlement_value if settlement_value is not None else previous.settlement_window_avg
+
         current = raw_value or avg_value or settlement_value
         if current is None:
             return
 
         now = datetime.now(timezone.utc)
         self.latest = BenchmarkSnapshot(
-            index_id=str(msg.get('index_id') or settings.cfbenchmarks_index_id),
+            index_id=index_id or settings.cfbenchmarks_index_id,
             value=current,
             avg_60s=avg_value,
             settlement_window_avg=settlement_value,
