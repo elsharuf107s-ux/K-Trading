@@ -1,8 +1,8 @@
 from datetime import datetime, timedelta, timezone
 
-from app.features import MarketBuffer, PriceBuffer, build_features
+from app.features import MarketBuffer, PriceBuffer, ReferenceBuffer, build_features
 from app.forecast import BaselineForecaster
-from app.models import BenchmarkSnapshot, BtcSnapshot, MarketSnapshot, PaperPosition
+from app.models import BenchmarkSnapshot, BtcSnapshot, MarketSnapshot
 from app.paper import PaperBroker
 from app.risk import AccountRiskState, RiskEngine
 
@@ -59,6 +59,24 @@ def test_official_benchmark_becomes_reference():
     assert f.reference_source == 'cfbenchmarks'
     assert f.reference_price == 100123.0
     assert f.distance_to_target_bps > 0
+
+
+def test_brti_momentum_drives_reference_features():
+    buf, mb, t = warm_buffers()
+    ref = ReferenceBuffer()
+    ref.add_benchmark(BenchmarkSnapshot(value=100000, captured_at=t))
+    ref.add_benchmark(BenchmarkSnapshot(value=100050, captured_at=t + timedelta(seconds=30)))
+    current = BenchmarkSnapshot(value=100120, avg_60s=100050, captured_at=t + timedelta(seconds=60))
+    ref.add_benchmark(current)
+    f = build_features(
+        market(),
+        BtcSnapshot(price=99950, sources={'a': 99950}, captured_at=t + timedelta(seconds=60)),
+        buf, mb, current, ref,
+    )
+    assert f.reference_source == 'cfbenchmarks'
+    assert f.reference_momentum_30s > 0
+    assert f.reference_momentum_60s > 0
+    assert f.reference_vol_60s >= 0
 
 
 def test_final_minute_uses_settlement_window_average():
@@ -118,9 +136,26 @@ def test_paper_settlement():
     assert round(broker.cash, 2) == 1006.00
 
 
+def test_paper_state_survives_storage_round_trip(tmp_path):
+    from app.storage import Storage
+    st = Storage(str(tmp_path / 'state.sqlite3'))
+    first = PaperBroker(1000)
+    first.open('KXBTC15M-PERSIST', 'yes', 12, 0.42, 'persist me')
+    first.kill_switch = True
+    st.save_paper_state(first.snapshot())
+
+    second = PaperBroker(1000)
+    second.restore(st.load_paper_state())
+    assert round(second.cash, 2) == round(first.cash, 2)
+    assert second.kill_switch is True
+    assert 'KXBTC15M-PERSIST' in second.positions
+    assert second.positions['KXBTC15M-PERSIST'].quantity == 12
+
+
 def test_cfbenchmarks_message_parser():
     from app.stream import CFBenchmarkStream
     stream = CFBenchmarkStream()
+    assert stream.status()['channel'] == 'cfbenchmarks_value'
     stream._handle({
         'type': 'cfbenchmarks_value',
         'msg': {
