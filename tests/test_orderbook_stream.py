@@ -41,10 +41,10 @@ def test_orderbook_snapshot_and_delta_build_live_book(monkeypatch):
 
     market = MarketSnapshot(ticker='KXBTC15M-TEST')
     updated = stream.apply_to_market(market)
-    assert updated.yes_bid == 0.42
-    assert updated.no_bid == 0.47
-    assert updated.yes_ask == 0.53
-    assert updated.no_ask == 0.58
+    assert updated.yes_bid == pytest.approx(0.42)
+    assert updated.no_bid == pytest.approx(0.47)
+    assert updated.yes_ask == pytest.approx(0.53)
+    assert updated.no_ask == pytest.approx(0.58)
     assert updated.yes_book
     assert updated.no_book
 
@@ -134,5 +134,5 @@ def test_execution_can_use_empirical_latency_override(monkeypatch):
         latency_penalty_override=0.003,
     )
     assert fill.filled_quantity == 5
-    assert round(fill.latency_slippage, 4) == 0.003
+    assert fill.latency_slippage == pytest.approx(0.003)
     assert 'empirical latency penalty' in fill.reason
