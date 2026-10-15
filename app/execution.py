@@ -6,22 +6,34 @@ from .config import settings
 from .models import ExecutionFill, MarketSnapshot
 
 
-def _ceil_cent(value: float) -> float:
-    return math.ceil(max(0.0, value) * 100.0 - 1e-12) / 100.0
+def _ceil_centicent(value: float) -> float:
+    # $0.0001 = one centicent.
+    return math.ceil(max(0.0, value) * 10_000.0 - 1e-12) / 10_000.0
 
 
 def event_contract_fee(quantity: int, price: float, maker: bool = False) -> float:
-    """Approximate Kalshi event-contract transaction fee using configured rate.
+    """Approximate Kalshi event-contract fee with current general rounding.
 
-    The research build intentionally keeps the rate configurable because fee
-    schedules and product exceptions can change. Rounding is applied to the
-    order-level fee in cents, matching the published general schedule formula.
+    July 2026 general schedule:
+      raw fee = multiplier * rate * C * P * (1-P)
+      fee + positionCost is rounded up to a centicent ($0.0001).
+
+    Product-specific multipliers can differ, so all rates/multipliers live in
+    settings and should be updated when Kalshi changes the schedule.
     """
     if quantity <= 0:
         return 0.0
     p = max(0.0, min(1.0, float(price)))
-    rate = settings.sim_maker_fee_rate if maker else settings.sim_taker_fee_rate
-    return _ceil_cent(rate * quantity * p * (1.0 - p))
+    if maker:
+        rate = settings.sim_maker_fee_rate
+        multiplier = settings.sim_maker_fee_multiplier
+    else:
+        rate = settings.sim_taker_fee_rate
+        multiplier = settings.sim_taker_fee_multiplier
+    position_cost = quantity * p
+    raw_fee = multiplier * rate * quantity * p * (1.0 - p)
+    rounded_total = _ceil_centicent(position_cost + raw_fee)
+    return max(0.0, rounded_total - position_cost)
 
 
 class ExecutionSimulator:
@@ -86,6 +98,7 @@ class ExecutionSimulator:
         top_price = float(book[0][0])
         remaining = requested
         notional = 0.0
+        fees = 0.0
         fills = 0
         penalty = self._latency_penalty(wave_score)
 
@@ -99,6 +112,10 @@ class ExecutionSimulator:
             adjusted = raw_price + penalty if intent == 'buy' else raw_price - penalty
             adjusted = max(0.01, min(0.99, adjusted))
             notional += take * adjusted
+            # A marketable order can match multiple resting price levels. Fee
+            # rounding is modeled per matched level instead of pretending all
+            # contracts traded at one average price.
+            fees += event_contract_fee(take, adjusted, maker=False)
             remaining -= take
             fills += 1
 
@@ -118,7 +135,6 @@ class ExecutionSimulator:
         average = notional / filled
         # Positive slippage means worse execution than the displayed top quote.
         slippage = average - top_price if intent == 'buy' else top_price - average
-        fee = event_contract_fee(filled, average, maker=False)
         complete = filled == requested
         fill_fraction = filled / requested
 
@@ -136,7 +152,7 @@ class ExecutionSimulator:
             filled_quantity=filled,
             average_price=average,
             top_price=top_price,
-            fee=fee,
+            fee=fees,
             slippage=max(0.0, slippage),
             latency_ms=settings.sim_latency_ms,
             levels_consumed=fills,
