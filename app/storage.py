@@ -172,42 +172,40 @@ class Storage:
         return [dict(zip(keys, row)) for row in cur.fetchall()]
 
     def execution_attribution(self, limit: int = 20000) -> dict[str, float | int]:
-        rows = self.db.execute(
-            '''SELECT status,requested_quantity,filled_quantity,gross_edge_before,executable_edge_after,
-               fee,depth_slippage,latency_slippage,total_slippage
-               FROM execution_events WHERE intent='buy' ORDER BY id DESC LIMIT ?''',
+        (
+            attempts, filled_attempts, rejected, no_liquidity, gross_total, executable_total,
+            total_filled, depth_total, latency_total, fee_total,
+        ) = self.db.execute(
+            '''SELECT COUNT(*),COALESCE(SUM(filled_quantity>0),0),COALESCE(SUM(status='rejected'),0),
+               COALESCE(SUM(status='no_liquidity'),0),TOTAL(gross_edge_before),TOTAL(executable_edge_after),
+               COALESCE(SUM(CASE WHEN filled_quantity>0 THEN filled_quantity END),0),
+               TOTAL(CASE WHEN filled_quantity>0 THEN depth_slippage*filled_quantity END),
+               TOTAL(CASE WHEN filled_quantity>0 THEN latency_slippage*filled_quantity END),
+               TOTAL(CASE WHEN filled_quantity>0 THEN fee END)
+               FROM (SELECT status,filled_quantity,gross_edge_before,executable_edge_after,fee,
+                     depth_slippage,latency_slippage
+                     FROM execution_events WHERE intent='buy' ORDER BY id DESC LIMIT ?)''',
             (limit,),
-        ).fetchall()
-        if not rows:
+        ).fetchone()
+        if not attempts:
             return {
                 'entry_attempts': 0,'filled_attempts': 0,'rejected_attempts': 0,'no_liquidity_attempts': 0,
                 'average_gross_edge': 0.0,'average_executable_edge': 0.0,'average_edge_drag': 0.0,
                 'average_depth_slippage': 0.0,'average_latency_slippage': 0.0,'average_fee_per_filled_contract': 0.0,
             }
-        attempts = len(rows)
-        filled_rows = [r for r in rows if int(r[2] or 0) > 0]
-        rejected = sum(1 for r in rows if r[0] == 'rejected')
-        no_liquidity = sum(1 for r in rows if r[0] == 'no_liquidity')
-        gross = sum(float(r[3] or 0.0) for r in rows) / attempts
-        executable = sum(float(r[4] or 0.0) for r in rows) / attempts
-        if filled_rows:
-            total_filled = sum(int(r[2] or 0) for r in filled_rows)
-            depth = sum(float(r[6] or 0.0) * int(r[2] or 0) for r in filled_rows) / total_filled
-            latency = sum(float(r[7] or 0.0) * int(r[2] or 0) for r in filled_rows) / total_filled
-            fees = sum(float(r[5] or 0.0) for r in filled_rows) / total_filled
-        else:
-            depth = latency = fees = 0.0
+        gross = gross_total / attempts
+        executable = executable_total / attempts
         return {
             'entry_attempts': attempts,
-            'filled_attempts': len(filled_rows),
+            'filled_attempts': filled_attempts,
             'rejected_attempts': rejected,
             'no_liquidity_attempts': no_liquidity,
             'average_gross_edge': gross,
             'average_executable_edge': executable,
             'average_edge_drag': gross - executable,
-            'average_depth_slippage': depth,
-            'average_latency_slippage': latency,
-            'average_fee_per_filled_contract': fees,
+            'average_depth_slippage': depth_total / total_filled if total_filled > 0 else 0.0,
+            'average_latency_slippage': latency_total / total_filled if total_filled > 0 else 0.0,
+            'average_fee_per_filled_contract': fee_total / total_filled if total_filled > 0 else 0.0,
         }
 
     def save_market_result(self, ticker: str, result: str, settled_at: str | None = None):
@@ -253,29 +251,28 @@ class Storage:
         keys = ['created_at', 'ticker', 'side', 'action', 'quantity', 'requested_quantity', 'price', 'pnl', 'fee', 'slippage', 'reason']
         return [dict(zip(keys, row)) for row in cur.fetchall()]
 
-    def closed_trade_records(self, limit: int = 20000) -> list[dict]:
-        cur = self.db.execute(
-            '''SELECT created_at,ticker,side,action,quantity,requested_quantity,price,pnl,fee,slippage,reason
-               FROM trades WHERE action IN ('close','settle') ORDER BY id DESC LIMIT ?''',
+    def closed_trade_stats(self, limit: int = 20000) -> dict[str, float | int]:
+        closed, realized, wins, gross_profit, losses, gross_loss = self.db.execute(
+            '''SELECT COUNT(*),TOTAL(pnl),COALESCE(SUM(pnl>0),0),TOTAL(CASE WHEN pnl>0 THEN pnl END),
+               COALESCE(SUM(pnl<0),0),TOTAL(CASE WHEN pnl<0 THEN pnl END)
+               FROM (SELECT pnl FROM trades WHERE action IN ('close','settle') ORDER BY id DESC LIMIT ?)''',
             (limit,),
-        )
-        keys = ['created_at', 'ticker', 'side', 'action', 'quantity', 'requested_quantity', 'price', 'pnl', 'fee', 'slippage', 'reason']
-        return [dict(zip(keys, row)) for row in cur.fetchall()]
+        ).fetchone()
+        return {
+            'closed_trades': closed, 'realized_pnl': realized, 'wins': wins,
+            'gross_profit': gross_profit, 'losses': losses, 'gross_loss': gross_loss,
+        }
 
     def execution_metrics(self, limit: int = 20000) -> dict[str, float | int]:
-        rows = self.db.execute(
-            '''SELECT quantity,requested_quantity,fee,slippage FROM trades
-               WHERE action IN ('open','close') ORDER BY id DESC LIMIT ?''',
+        fills, filled, requested, fees, weighted_slippage = self.db.execute(
+            '''SELECT COUNT(*),COALESCE(SUM(quantity),0),COALESCE(SUM(COALESCE(requested_quantity,quantity)),0),
+               TOTAL(fee),TOTAL(slippage*quantity)
+               FROM (SELECT quantity,requested_quantity,fee,slippage FROM trades
+                     WHERE action IN ('open','close') ORDER BY id DESC LIMIT ?)''',
             (limit,),
-        ).fetchall()
-        if not rows:
-            return {'fills':0,'requested_contracts':0,'filled_contracts':0,'fill_rate':0.0,'fees':0.0,'average_slippage':0.0}
-        filled = sum(int(row[0] or 0) for row in rows)
-        requested = sum(int(row[1] if row[1] is not None else row[0] or 0) for row in rows)
-        fees = sum(float(row[2] or 0.0) for row in rows)
-        weighted_slippage = sum(float(row[3] or 0.0) * int(row[0] or 0) for row in rows)
+        ).fetchone()
         return {
-            'fills': len(rows),'requested_contracts': requested,'filled_contracts': filled,
+            'fills': fills,'requested_contracts': requested,'filled_contracts': filled,
             'fill_rate': filled / requested if requested > 0 else 0.0,'fees': fees,
             'average_slippage': weighted_slippage / filled if filled > 0 else 0.0,
         }

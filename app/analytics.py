@@ -22,37 +22,48 @@ class ResearchAnalytics:
 
     def __init__(self, storage: Storage):
         self.storage = storage
+        self._labeled_cache: tuple[tuple[int, int], dict] | None = None
 
-    def summary(self) -> dict:
+    def _labeled_summary(self) -> dict:
+        # Brier/calibration read up to 100k labeled snapshots, but they only
+        # change when a market settles, so recompute just on label changes.
+        version = self.storage.labels_version()
+        if self._labeled_cache is not None and self._labeled_cache[0] == version:
+            return self._labeled_cache[1]
         snapshots = self.storage.labeled_observations(limit=100_000)
         windows = self.storage.last_labeled_observations(limit=20_000)
-        trades = self.storage.closed_trade_records(limit=20_000)
 
         model_brier = _brier(windows, 'model_probability')
         market_brier = _brier(windows, 'market_probability')
         improvement = None
         if model_brier is not None and market_brier not in (None, 0):
             improvement = (market_brier - model_brier) / market_brier
-
-        wins = [float(t['pnl']) for t in trades if float(t['pnl']) > 0]
-        losses = [float(t['pnl']) for t in trades if float(t['pnl']) < 0]
-        gross_profit = sum(wins)
-        gross_loss = abs(sum(losses))
-        profit_factor = gross_profit / gross_loss if gross_loss > 0 else (inf if gross_profit > 0 else None)
-
-        return {
+        summary = {
             'completed_windows': len(windows),
             'labeled_snapshots': len(snapshots),
             'model_brier_last_snapshot': model_brier,
             'market_brier_last_snapshot': market_brier,
             'brier_improvement_vs_market': improvement,
             'calibration': self._calibration(snapshots),
+        }
+        self._labeled_cache = (version, summary)
+        return summary
+
+    def summary(self) -> dict:
+        trades = self.storage.closed_trade_stats(limit=20_000)
+        closed = trades['closed_trades']
+        gross_profit = trades['gross_profit']
+        gross_loss = abs(trades['gross_loss'])
+        profit_factor = gross_profit / gross_loss if gross_loss > 0 else (inf if gross_profit > 0 else None)
+
+        return {
+            **self._labeled_summary(),
             'trading': {
-                'closed_trades': len(trades),
-                'realized_pnl': sum(float(t['pnl']) for t in trades),
-                'win_rate': len(wins) / len(trades) if trades else None,
-                'average_win': sum(wins) / len(wins) if wins else None,
-                'average_loss': sum(losses) / len(losses) if losses else None,
+                'closed_trades': closed,
+                'realized_pnl': trades['realized_pnl'],
+                'win_rate': trades['wins'] / closed if closed else None,
+                'average_win': trades['gross_profit'] / trades['wins'] if trades['wins'] else None,
+                'average_loss': trades['gross_loss'] / trades['losses'] if trades['losses'] else None,
                 'profit_factor': None if profit_factor is None else (profit_factor if profit_factor != inf else 'inf'),
             },
             'execution': self.storage.execution_metrics(),

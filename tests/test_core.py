@@ -255,3 +255,25 @@ def test_market_windows_backfill_for_existing_databases(tmp_path):
         "SELECT first_observation_id,last_observation_id FROM market_windows WHERE ticker='KXBTC15M-A'"
     ).fetchone()
     assert window == (1, last_a)
+
+
+def test_analytics_recomputes_when_a_new_market_settles(tmp_path):
+    from app.analytics import ResearchAnalytics
+    from app.storage import Storage
+    st = Storage(str(tmp_path / 'cache.sqlite3'))
+    analytics = ResearchAnalytics(st)
+
+    def observe(ticker):
+        m = market(ticker=ticker)
+        f = build_features(m, BtcSnapshot(price=100050, sources={'a': 100050}), PriceBuffer(), MarketBuffer())
+        st.save_observation(m, f, BaselineForecaster().predict(f))
+
+    observe('KXBTC15M-ONE')
+    st.save_market_result('KXBTC15M-ONE', 'yes')
+    assert analytics.summary()['completed_windows'] == 1
+    observe('KXBTC15M-TWO')
+    assert analytics.summary()['completed_windows'] == 1
+    st.save_market_result('KXBTC15M-TWO', 'no')
+    report = analytics.summary()
+    assert report['completed_windows'] == 2
+    assert report['labeled_snapshots'] == 2
