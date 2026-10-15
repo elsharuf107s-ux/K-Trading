@@ -1,113 +1,114 @@
-# K-Trading — Kalshi BTC 15-Minute AI Lab
+# K-Trading
 
-K-Trading is a paper-first research and execution platform for Kalshi's short-duration Bitcoin markets. V1 ingests the live market, estimates fair YES probability from market + BTC micro-momentum, trades only when after-cost edge clears hard risk rules, and journals every observation so calibrated models can replace the baseline later.
+K-Trading is a **paper-trading research engine** for Kalshi's rolling `KXBTC15M` Bitcoin markets.
 
-> **Status: V1 foundation / paper trading only.** `LIVE_TRADING_ENABLED=true` is intentionally blocked by the risk engine in this version.
+The goal is to test one thing honestly: whether a short-horizon model can estimate a fair probability better than the live Kalshi market **after spread, fees/cost buffers, execution friction, and risk controls**.
 
-## Working now
+> **V0.2 is paper-only. Real-money order execution is not implemented.**
 
-- Discovers an open short-duration BTC market through Kalshi's public V2 market API.
-- Reads YES/NO prices and contract timing.
-- Pulls BTC spot proxy prices from Coinbase + Kraken and uses the median.
-- Tracks 30s/60s/180s momentum and realized volatility.
-- Produces a conservative fair-probability estimate anchored to Kalshi's implied probability.
-- Calculates YES and NO edge after uncertainty + cost buffers.
-- Enforces spread, expiry, bankroll, max-position, loss, drawdown, stop-loss and kill-switch limits.
-- Paper opens/closes positions and writes observations/trades to SQLite.
-- Serves a browser trading terminal on port `8000`.
-- Includes a GitHub Codespaces devcontainer.
+## What V0.2 does
 
-## Run in Codespaces
+- Discovers the current `KXBTC15M` market automatically.
+- Reads the live public Kalshi order book and derives YES/NO bid/ask, top depth, spread, and imbalance.
+- Reads Coinbase + Kraken BTC spot as public cross-check/momentum feeds.
+- Optionally connects to Kalshi's authenticated WebSocket and streams CF Benchmarks `BRTI`.
+- Uses BRTI as the primary reference when available.
+- Uses Kalshi's `last_60s_windowed_average_15min` field in the final minute when present.
+- Builds short-term BTC momentum, Kalshi probability momentum, order-book imbalance, target distance, and a wave score.
+- Produces a conservative model fair probability anchored to the market.
+- Trades only when after-cost edge and wave direction agree.
+- Exits on edge decay, wave reversal, stop loss, trailing-profit giveback, or time/reference safety gates.
+- Settles stale paper positions once Kalshi reports the prior market result.
+- Journals observations and trades to SQLite.
+- Exposes a localhost/Codespaces dashboard and JSON API.
+
+## Architecture
+
+```text
+KXBTC15M market + order book
+            |
+            +--------------------+
+            |                    |
+            v                    v
+      Kalshi probability     CF Benchmarks BRTI
+                                  |
+Coinbase + Kraken ----------------+
+            |
+            v
+       Feature engine
+            |
+     BTC momentum
+     market momentum
+     order-book imbalance
+     target distance
+     wave score
+            |
+            v
+    Probability forecaster
+            |
+            v
+ model fair value - market price
+       - friction buffers
+            |
+            v
+       hard risk engine
+            |
+     BUY / HOLD / EXIT
+            |
+            v
+       paper broker
+            |
+            v
+      SQLite research log
+```
+
+## Run in Codespaces / Linux
 
 ```bash
 cp .env.example .env
+pip install -r requirements.txt
 ./scripts/run.sh
 ```
 
 Open forwarded port **8000**.
 
-## Run locally
+You can also run directly:
 
 ```bash
-python -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-cp .env.example .env
-./scripts/run.sh
+uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 ```
 
-Or:
+## Enable the official BRTI stream
 
-```bash
-cp .env.example .env
-docker compose up --build
+Kalshi's WebSocket requires API authentication even for public market-data channels.
+
+Create a Kalshi API key, keep the **private key out of Git**, then set:
+
+```env
+KALSHI_KEY_ID=your-key-id
+KALSHI_PRIVATE_KEY_PATH=/workspaces/K-Trading/kalshi-private-key.pem
+ENABLE_KALSHI_WS=true
+CFBENCHMARKS_INDEX_ID=BRTI
 ```
 
-## Architecture
+`KALSHI_PRIVATE_KEY_PEM` is also supported, but a secret/file outside the repository is preferable.
 
-```text
-Kalshi public markets ──┐
-                       ├──> Feature Engine ──> Probability Model
-BTC proxy feeds ───────┘                           │
-                                                   v
-                                    Fair probability vs market
-                                                   │
-                                                   v
-                                      After-cost usable edge
-                                                   │
-                                                   v
-                                          HARD RISK ENGINE
-                                                   │
-                                                   v
-                                             PAPER BROKER
-                                                   │
-                                SQLite journal + dashboard
-```
+The dashboard will show:
 
-## Settlement/reference-data warning
+- `LIVE` when the authenticated BRTI feed is healthy.
+- `NO KEY` when no credentials are configured.
+- proxy mode using Coinbase/Kraken if BRTI is unavailable.
 
-The Coinbase/Kraken spot feeds are **features only**, not settlement truth. Kalshi states that most crypto price markets use CF Benchmarks indexes and that a 15-minute market compares the average from the minute before close with the average from the minute before open. Exact market rules and contract terms control. Live trading must stay locked until authenticated CF Benchmarks/reference data and historical point-in-time validation are added.
+When BRTI is unavailable, K-Trading **blocks new final-minute entries** by default.
 
-## API
+## Main API routes
 
 - `GET /api/health`
 - `GET /api/state`
 - `GET /api/trades`
+- `GET /api/observations`
 - `POST /api/cycle`
-- `POST /api/kill-switch` with `{ "enabled": true }`
-
-## Strategy settings
-
-See `.env.example`. Important defaults include:
-
-```env
-AUTO_PAPER_TRADE=true
-PAPER_STARTING_CASH=1000
-MIN_USABLE_EDGE=0.04
-MAX_POSITION_USD=15
-MAX_BANKROLL_FRACTION=0.015
-MAX_SPREAD=0.12
-MIN_SECONDS_TO_EXPIRY=45
-LIVE_TRADING_ENABLED=false
-```
-
-If discovery misses the live contract:
-
-```env
-MARKET_TICKER_OVERRIDE=<kalshi-market-ticker>
-```
-
-## Model philosophy
-
-The current `BaselineForecaster` is deliberately conservative and is **not a claim of profitable AI**. The first objective is clean point-in-time data collection. Once enough completed windows exist, replace it behind the same interface with calibrated logistic regression / LightGBM, walk-forward validation, probability calibration and regime-specific ensembles.
-
-## Next milestones
-
-1. **Data integrity:** Kalshi WebSocket book/trade stream, exact series discovery, event live data, CF Benchmarks pass-through, second-level persistence.
-2. **Backtesting:** replay completed windows without look-ahead; include bid/ask fills, fees and latency; score calibration/Brier/P&L.
-3. **Learning:** dataset builder, walk-forward splits, logistic baseline, LightGBM candidate, calibration and model registry.
-4. **Wave management:** separate entry/exit models, trailing profit, regime detection and order-book imbalance.
-5. **Live gate:** only after paper/out-of-sample thresholds—authenticated V2 orders, idempotency, reconciliation, freshness shutdowns and tiny capped position sizing.
+- `POST /api/kill-switch`
 
 ## Tests
 
@@ -115,4 +116,49 @@ The current `BaselineForecaster` is deliberately conservative and is **not a cla
 pytest -q
 ```
 
-The initial core currently passes three local unit tests covering bounded forecasts, hard spread rejection and paper round-trip accounting.
+Current V0.2 test coverage includes:
+
+- bounded forecast output
+- official BRTI reference preference
+- final-minute settlement-window reference selection
+- spread risk rejection
+- final-minute proxy guard
+- paper round-trip accounting
+- paper market settlement
+- CF Benchmarks WebSocket payload parsing
+
+## Safety / research rules
+
+1. **Paper first.**
+2. No live-order executor exists in V0.2.
+3. Do not judge the system by win rate alone.
+4. Track net P&L after costs, calibration, Brier score, drawdown, edge capture, and performance by regime.
+5. Never use later/final data in historical decisions.
+6. A model that cannot beat simple baselines out-of-sample does not have proven edge.
+7. Kalshi's actual market rules control settlement.
+
+## Next milestones
+
+### V0.3 — data collector + replay
+- second-level observation capture
+- historical market ingestion
+- deterministic window replay
+- calibration buckets
+- Brier score / expected-value reporting
+- regime performance report
+
+### V0.4 — model lab
+- logistic-regression baseline
+- LightGBM/XGBoost candidate models
+- walk-forward validation
+- model registry / champion-vs-challenger
+- no-lookahead test suite
+
+### V0.5 — execution simulator
+- order-book-depth fills
+- partial fills
+- latency model
+- fee model from current Kalshi schedule
+- slippage curves
+
+Real execution remains gated until the research stack demonstrates durable out-of-sample behavior.

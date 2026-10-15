@@ -9,7 +9,7 @@ from .models import BtcSnapshot
 
 class BtcPriceClient:
     def __init__(self):
-        self._client = httpx.AsyncClient(timeout=5.0, headers={'User-Agent': 'K-Trading/0.1'})
+        self._client = httpx.AsyncClient(timeout=5.0, headers={'User-Agent': 'K-Trading/0.2'})
 
     async def close(self) -> None:
         await self._client.aclose()

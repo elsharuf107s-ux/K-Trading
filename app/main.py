@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from contextlib import asynccontextmanager
 from pathlib import Path
+
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -19,7 +20,7 @@ async def lifespan(app: FastAPI):
     await engine.stop()
 
 
-app = FastAPI(title='K-Trading', version='0.1.0', lifespan=lifespan)
+app = FastAPI(title='K-Trading', version='0.2.0', lifespan=lifespan)
 
 WEB_DIR = Path(__file__).resolve().parent.parent / 'web'
 if WEB_DIR.exists():
@@ -37,7 +38,12 @@ async def dashboard():
 
 @app.get('/api/health')
 async def health():
-    return {'ok': True, 'status': engine.last_state.get('status'), 'mode': 'paper'}
+    return {
+        'ok': True,
+        'status': engine.last_state.get('status'),
+        'mode': 'paper',
+        'benchmark_stream': engine.benchmark_stream.status(),
+    }
 
 
 @app.get('/api/state')
@@ -48,6 +54,11 @@ async def state():
 @app.get('/api/trades')
 async def trades(limit: int = 50):
     return {'trades': engine.storage.recent_trades(max(1, min(limit, 500)))}
+
+
+@app.get('/api/observations')
+async def observations(limit: int = 200):
+    return {'observations': engine.storage.recent_observations(max(1, min(limit, 2000)))}
 
 
 @app.post('/api/cycle')

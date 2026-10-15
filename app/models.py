@@ -26,6 +26,9 @@ class MarketSnapshot(BaseModel):
     seconds_remaining: float = 0.0
     raw_target: float | None = None
     rules_primary: str = ''
+    yes_depth: float = 0.0
+    no_depth: float = 0.0
+    book_imbalance: float = 0.0
     captured_at: datetime = Field(default_factory=utc_now)
 
     @property
@@ -45,9 +48,23 @@ class BtcSnapshot(BaseModel):
     captured_at: datetime = Field(default_factory=utc_now)
 
 
+class BenchmarkSnapshot(BaseModel):
+    index_id: str = 'BRTI'
+    value: float | None = None
+    avg_60s: float | None = None
+    settlement_window_avg: float | None = None
+    received_at_ms: int | None = None
+    captured_at: datetime = Field(default_factory=utc_now)
+    source: str = 'cfbenchmarks_ws'
+
+
 class FeatureVector(BaseModel):
     ticker: str
     btc_price: float
+    reference_price: float
+    reference_source: str
+    benchmark_avg_60s: float | None = None
+    settlement_window_avg: float | None = None
     market_probability: float
     yes_bid: float
     yes_ask: float
@@ -55,6 +72,7 @@ class FeatureVector(BaseModel):
     no_ask: float
     spread: float
     seconds_remaining: float
+    momentum_10s: float = 0.0
     momentum_30s: float = 0.0
     momentum_60s: float = 0.0
     momentum_180s: float = 0.0
@@ -62,13 +80,20 @@ class FeatureVector(BaseModel):
     source_dispersion: float = 0.0
     target_price: float | None = None
     distance_to_target_bps: float | None = None
+    yes_depth: float = 0.0
+    no_depth: float = 0.0
+    book_imbalance: float = 0.0
+    market_momentum_10s: float = 0.0
+    market_momentum_30s: float = 0.0
+    wave_score: float = 0.0
+    wave_state: Literal['UP', 'DOWN', 'FLAT'] = 'FLAT'
 
 
 class Forecast(BaseModel):
     yes_probability: float
     confidence: float
     rationale: list[str]
-    model_name: str = 'market-anchor-momentum-v1'
+    model_name: str = 'market-anchor-wave-v2'
 
 
 class Decision(BaseModel):
@@ -94,7 +119,7 @@ class PaperPosition(BaseModel):
 class TradeRecord(BaseModel):
     ticker: str
     side: Literal['yes', 'no']
-    action: Literal['open', 'close']
+    action: Literal['open', 'close', 'settle']
     quantity: int
     price: float
     pnl: float = 0.0

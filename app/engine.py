@@ -5,13 +5,13 @@ from datetime import datetime, timezone
 
 from .btc import BtcPriceClient
 from .config import settings
-from .features import PriceBuffer, build_features
+from .features import MarketBuffer, PriceBuffer, build_features
 from .forecast import BaselineForecaster
 from .kalshi import KalshiPublicClient
-from .models import Decision
 from .paper import PaperBroker
 from .risk import AccountRiskState, RiskEngine
 from .storage import Storage
+from .stream import CFBenchmarkStream
 
 
 class TradingEngine:
@@ -20,6 +20,8 @@ class TradingEngine:
         self.kalshi = KalshiPublicClient()
         self.btc = BtcPriceClient()
         self.buffer = PriceBuffer()
+        self.market_buffer = MarketBuffer()
+        self.benchmark_stream = CFBenchmarkStream()
         self.forecaster = BaselineForecaster()
         self.risk = RiskEngine()
         self.paper = PaperBroker(settings.paper_starting_cash)
@@ -28,12 +30,13 @@ class TradingEngine:
             'status': 'starting',
             'mode': 'paper',
             'live_trading_enabled': settings.live_trading_enabled,
-            'warning': 'V1 is paper-only. BTC spot feeds are proxies; Kalshi settlement rules control.',
+            'warning': 'Paper-only. Authenticated BRTI streaming activates when Kalshi API credentials are configured.',
         }
         self._stop = asyncio.Event()
         self._task: asyncio.Task | None = None
 
     async def start(self) -> None:
+        await self.benchmark_stream.start()
         if self._task is None:
             self._task = asyncio.create_task(self._loop(), name='trading-engine')
 
@@ -41,6 +44,7 @@ class TradingEngine:
         self._stop.set()
         if self._task:
             await self._task
+        await self.benchmark_stream.stop()
         await self.kalshi.close()
         await self.btc.close()
 
@@ -61,6 +65,23 @@ class TradingEngine:
             except asyncio.TimeoutError:
                 pass
 
+    async def _reconcile_old_positions(self, current_ticker: str) -> list:
+        settlements = []
+        for ticker in list(self.paper.positions):
+            if ticker == current_ticker:
+                continue
+            try:
+                raw = await self.kalshi.get_market(ticker)
+            except Exception:
+                continue
+            result = str(raw.get('result') or '').lower()
+            if result not in ('yes', 'no'):
+                continue
+            trade = self.paper.settle(ticker, result)
+            self.storage.save_trade(trade)
+            settlements.append(trade)
+        return settlements
+
     async def cycle(self) -> dict:
         market = await self.kalshi.discover_btc_15m()
         if market is None:
@@ -68,13 +89,19 @@ class TradingEngine:
                 **self.last_state,
                 'status': 'waiting_for_market',
                 'updated_at': datetime.now(timezone.utc).isoformat(),
+                'feed': self.benchmark_stream.status(),
                 'error': None,
             }
             return self.last_state
 
+        market = await self.kalshi.enrich_orderbook(market)
+        settlements = await self._reconcile_old_positions(market.ticker)
+
         btc = await self.btc.get()
         self.buffer.add(btc)
-        features = build_features(market, btc, self.buffer)
+        self.market_buffer.add(market)
+        benchmark = self.benchmark_stream.fresh()
+        features = build_features(market, btc, self.buffer, self.market_buffer, benchmark)
         forecast = self.forecaster.predict(features)
         self.storage.save_observation(market, features, forecast)
 
@@ -100,7 +127,9 @@ class TradingEngine:
         else:
             decision = self.risk.evaluate_entry(features, forecast, account)
             if settings.auto_paper_trade and decision.action in ('BUY_YES', 'BUY_NO') and decision.quantity > 0:
-                trade = self.paper.open(market.ticker, decision.side, decision.quantity, decision.price, decision.reason)
+                trade = self.paper.open(
+                    market.ticker, decision.side, decision.quantity, decision.price, decision.reason
+                )
                 self.storage.save_trade(trade)
 
         pos_after = self.paper.positions.get(market.ticker)
@@ -115,10 +144,13 @@ class TradingEngine:
             'updated_at': datetime.now(timezone.utc).isoformat(),
             'market': market.model_dump(mode='json'),
             'btc': btc.model_dump(mode='json'),
+            'benchmark': benchmark.model_dump(mode='json') if benchmark else None,
+            'feed': self.benchmark_stream.status(),
             'features': features.model_dump(mode='json'),
             'forecast': forecast.model_dump(mode='json'),
             'decision': decision.model_dump(mode='json'),
             'trade': trade.model_dump(mode='json') if trade else None,
+            'settlements': [x.model_dump(mode='json') for x in settlements],
             'account': {
                 'starting_cash': self.paper.starting_cash,
                 'cash': round(self.paper.cash, 4),
@@ -128,7 +160,11 @@ class TradingEngine:
                 'kill_switch': self.paper.kill_switch,
             },
             'live_trading_enabled': settings.live_trading_enabled,
-            'warning': 'Paper mode only. Spot feeds are features, not the official settlement value.',
+            'warning': (
+                'Using authenticated CF Benchmarks BRTI reference.'
+                if benchmark
+                else 'No fresh BRTI stream: using Coinbase/Kraken proxy. Final-minute entries are blocked.'
+            ),
             'error': None,
         }
         return self.last_state
