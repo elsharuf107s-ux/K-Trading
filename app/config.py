@@ -49,13 +49,14 @@ class Settings(BaseSettings):
     model_min_windows: int = 24
     model_min_brier_gain: float = 0.002
 
-    # V0.5 execution simulator. Prediction-market schedules can change, so the
-    # rates are explicit configuration rather than hidden constants. Defaults
-    # match Kalshi's published general event-contract fee formula currently
-    # used by the research build: rate * C * P * (1-P), rounded up to cents.
+    # V0.5 execution simulator. Fee settings mirror the July 2026 general
+    # event-contract schedule and stay configurable because Kalshi can change
+    # schedules or apply series-specific multipliers.
     execution_book_depth: int = 20
     sim_taker_fee_rate: float = 0.07
+    sim_taker_fee_multiplier: float = 1.0
     sim_maker_fee_rate: float = 0.0175
+    sim_maker_fee_multiplier: float = 0.0
     sim_latency_ms: float = 250.0
     sim_latency_price_drift_per_second: float = 0.004
     sim_max_latency_slippage: float = 0.01
