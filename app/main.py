@@ -55,7 +55,7 @@ async def health():
         'auto_training': engine.last_state.get('auto_training'),
         'execution': engine.storage.execution_metrics(),
         'execution_attribution': engine.storage.execution_attribution(),
-        'empirical_latency': engine.last_state.get('empirical_latency_model'),
+        'empirical_latency': engine.last_state.get('empirical_latency_model') or engine._latency_model(),
     }
 
 
@@ -75,9 +75,8 @@ async def execution_metrics():
         'fills': engine.storage.execution_metrics(),
         'attribution': engine.storage.execution_attribution(),
         'empirical': engine.empirical.summary(engine.orderbook_stream.horizons_ms),
-        'latency_model': engine.empirical.recommended_adverse_slippage(
-            engine.orderbook_stream.horizons_ms[0] if not engine.last_state.get('empirical_latency_model') else engine.last_state['empirical_latency_model'].get('requested_latency_ms', 250),
-        ),
+        'latency_model': engine._latency_model(),
+        'empirical_latency_enabled': bool(engine.last_state.get('empirical_latency_enabled')),
     }
 
 
