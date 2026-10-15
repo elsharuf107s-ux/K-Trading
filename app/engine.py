@@ -8,6 +8,7 @@ from .config import settings
 from .features import MarketBuffer, PriceBuffer, ReferenceBuffer, build_features
 from .forecast import BaselineForecaster
 from .kalshi import KalshiPublicClient
+from .model_lab import AdaptiveForecaster, ModelRegistry
 from .paper import PaperBroker
 from .risk import AccountRiskState, RiskEngine
 from .storage import Storage
@@ -23,7 +24,8 @@ class TradingEngine:
         self.reference_buffer = ReferenceBuffer()
         self.market_buffer = MarketBuffer()
         self.benchmark_stream = CFBenchmarkStream()
-        self.forecaster = BaselineForecaster()
+        self.model_registry = ModelRegistry()
+        self.forecaster = AdaptiveForecaster(BaselineForecaster(), self.model_registry)
         self.risk = RiskEngine()
         self.storage = Storage(settings.database_path)
         self.paper = PaperBroker(settings.paper_starting_cash)
@@ -32,6 +34,7 @@ class TradingEngine:
             'status': 'starting',
             'mode': 'paper',
             'live_trading_enabled': settings.live_trading_enabled,
+            'model_registry': self.model_registry.status(),
             'warning': 'Paper-only. Authenticated BRTI streaming activates when Kalshi API credentials are configured.',
         }
         self._stop = asyncio.Event()
@@ -99,6 +102,7 @@ class TradingEngine:
                 'status': 'waiting_for_market',
                 'updated_at': datetime.now(timezone.utc).isoformat(),
                 'feed': self.benchmark_stream.status(),
+                'model_registry': self.model_registry.status(),
                 'error': None,
             }
             return self.last_state
@@ -175,6 +179,7 @@ class TradingEngine:
             'decision': decision.model_dump(mode='json'),
             'trade': trade.model_dump(mode='json') if trade else None,
             'settlements': [x.model_dump(mode='json') for x in settlements],
+            'model_registry': self.model_registry.status(),
             'account': {
                 'starting_cash': self.paper.starting_cash,
                 'cash': round(self.paper.cash, 4),
